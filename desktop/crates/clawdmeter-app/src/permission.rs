@@ -257,6 +257,13 @@ impl Bridge {
         }
     }
 
+    /// The device can't show `id` whole: hand it back to the terminal.
+    pub fn withdraw(&mut self, state_dir: &Path, id: u32) {
+        if self.shown.contains_key(&id) {
+            let _ = fs::remove_file(req_file(state_dir, id));
+        }
+    }
+
     /// The connected device may not answer: hand every waiting request back
     /// to the terminal at once (the hooks see their file gone).
     pub fn decline_all(&mut self, state_dir: &Path, now: i64) {

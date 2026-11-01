@@ -449,8 +449,8 @@ static bool handle_perm_message(const char* raw) {
     if (doc[K_PQ].isNull()) return false;
     const uint32_t id = doc[K_ID] | 0u;
     if ((doc[K_PQ] | 0) == 1) {
-        perm_show(id, doc[K_TOOL] | "", doc[K_T] | "", 45000);
-        idle_note_activity();   // wake the panel for it
+        if (perm_show(id, doc[K_TOOL] | "", doc[K_T] | "", 45000)) idle_note_activity();   // wake the panel for it
+        else ble_send_perm_skip(id);   // can't show it whole: the terminal asks
     } else {
         perm_hide(id);
     }

@@ -497,6 +497,12 @@ pub enum DeviceEvent {
         /// Allow (else deny).
         allow: bool,
     },
+    /// clawdmeter2 TX `{"perm":N,"skip":true}`: the device can't show the
+    /// request whole; the terminal should ask.
+    PermissionSkipped {
+        /// The request id.
+        id: u32,
+    },
 }
 
 /// The device's events, in order.
@@ -513,10 +519,13 @@ pub fn device_event(uuid: Uuid, value: &[u8]) -> Option<DeviceEvent> {
     }
     let text: String = std::str::from_utf8(value).ok()?.chars().filter(|c| !c.is_whitespace()).collect();
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-        if let (Some(id), Some(allow)) =
-            (v.get("perm").and_then(|x| x.as_u64()), v.get("allow").and_then(|x| x.as_bool()))
-        {
-            return Some(DeviceEvent::Permission { id: id as u32, allow });
+        if let Some(id) = v.get("perm").and_then(|x| x.as_u64()).and_then(|id| u32::try_from(id).ok()) {
+            if v.get("skip").and_then(|x| x.as_bool()) == Some(true) {
+                return Some(DeviceEvent::PermissionSkipped { id });
+            }
+            if let Some(allow) = v.get("allow").and_then(|x| x.as_bool()) {
+                return Some(DeviceEvent::Permission { id, allow });
+            }
         }
     }
     text.contains("\"dismiss\":true").then_some(DeviceEvent::Dismissed)
@@ -982,6 +991,12 @@ mod tests {
         assert_eq!(device_event(TX_UUID, br#"{"err":true}"#), None);
         assert_eq!(device_event(TX_UUID, &[0xff, 0xfe]), None);
         assert_eq!(device_event(RX_UUID, br#"{"dismiss":true}"#), None);
+        assert_eq!(
+            device_event(TX_UUID, br#"{"perm":7,"allow":true}"#),
+            Some(DeviceEvent::Permission { id: 7, allow: true })
+        );
+        assert_eq!(device_event(TX_UUID, br#"{"perm":7,"skip":true}"#), Some(DeviceEvent::PermissionSkipped { id: 7 }));
+        assert_eq!(device_event(TX_UUID, br#"{"perm":4294967303,"allow":true}"#), None, "id must fit u32");
         // The firmware's reply, as written.
         let src = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../firmware/src/ble.cpp"),
@@ -1003,7 +1018,13 @@ mod tests {
             for u in [SERVICE_UUID, RX_UUID, TX_UUID, REQ_UUID] {
                 assert!(src.contains(&u.to_string()), "{u} not in firmware/src/ble.cpp");
             }
-            assert!(src.contains("BLE_BUF_SIZE 512"), "RX buffer size changed; revisit MAX_WRITE");
+            // The firmware's RX buffer holds a whole write plus its NUL.
+            let buf: usize = src
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("#define BLE_BUF_SIZE "))
+                .and_then(|r| r.split_whitespace().next()?.parse().ok())
+                .expect("BLE_BUF_SIZE in ble.cpp");
+            assert!(buf > MAX_WRITE, "firmware RX buffer {buf} too small for MAX_WRITE {MAX_WRITE}");
         }
     }
 

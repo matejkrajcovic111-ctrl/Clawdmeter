@@ -374,6 +374,10 @@ pub async fn run(paths: Paths, mut commands: mpsc::UnboundedReceiver<Command>, s
                         log::info!("attention alert dismissed on the device");
                         engine.on_device_dismissed();
                     }
+                    DeviceEvent::PermissionSkipped { id } => {
+                        perm_bridge.withdraw(&paths.state_dir, id);
+                        log::info!("permission {id}: too long for the device, asking in the terminal");
+                    }
                     DeviceEvent::Permission { id, allow } => {
                         let ok = perm_trusted && perm_bridge.answer(&paths.state_dir, id, allow);
                         log::info!(

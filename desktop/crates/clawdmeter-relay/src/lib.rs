@@ -241,7 +241,11 @@ pub fn hook_event(args: &[String], input: &Value, accounts: &[PathBuf], ts: u64)
 /// per machine and never collide) and a transcript path under the matching
 /// local account, so the daemon attributes the event to that account.
 pub fn to_local_hook_input(ev: &HookEvent, machine: &str, config_dirs: &[PathBuf]) -> Value {
-    // It came over the network and goes into a path: only [A-Za-z0-9_-].
+    // Both came over the network and go into a path: only [A-Za-z0-9_-].
+    let machine = match machine_name(machine) {
+        m if m.is_empty() => "relay".to_owned(),
+        m => m,
+    };
     let session: String = ev
         .session
         .chars()
@@ -456,6 +460,9 @@ mod tests {
         let v2 = to_local_hook_input(&HookEvent { session: "../../x/y".into(), ..ev.clone() }, "proxmox", &dirs);
         assert_eq!(v2["session_id"], "proxmox.______x_y");
         assert!(!v2["transcript_path"].as_str().unwrap().contains(".."));
+        let v3 = to_local_hook_input(&ev, "../../evil", &dirs);
+        assert!(!v3["transcript_path"].as_str().unwrap().contains(".."));
+        assert!(v3["session_id"].as_str().unwrap().starts_with("evil."));
         // Unknown account: no transcript path, so the event is unattributed.
         let v = to_local_hook_input(&HookEvent { account: Some(5), ..ev }, "proxmox", &dirs);
         assert!(v.get("transcript_path").is_none());

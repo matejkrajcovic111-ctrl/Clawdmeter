@@ -18,6 +18,7 @@ LV_FONT_DECLARE(font_styrene_16);
 #define BAR_H      4
 
 static lv_obj_t *root, *lbl_head, *lbl_tool, *lbl_text;
+static int text_box_w = 0, text_box_h = 0;   // the command's box, for the fit check
 static lv_obj_t *bar_track, *bar_fill;
 static lv_obj_t *btn_deny, *btn_allow, *lbl_deny, *lbl_allow;
 
@@ -135,6 +136,8 @@ void perm_init(lv_obj_t* parent) {
     lbl_text = make_label(f_text, THEME_TEXT, root);
     lv_label_set_long_mode(lbl_text, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_size(lbl_text, cw, lines * line);
+    text_box_w = cw;
+    text_box_h = lines * line;
     lv_obj_set_pos(lbl_text, cx, text_y);
 
     btn_deny = make_btn(THEME_RED, 3, radius);
@@ -178,9 +181,15 @@ static void set_bar(int w) {
     }
 }
 
-void perm_show(uint32_t id, const char* tool, const char* text, uint32_t timeout_ms) {
-    if (!root || id == 0) return;              // no id: nothing to answer
-    if (shown && id == cur_id) return;          // already up: keep its timer and arming
+bool perm_show(uint32_t id, const char* tool, const char* text, uint32_t timeout_ms) {
+    if (!root || id == 0) return false;        // no id: nothing to answer
+    if (shown && id == cur_id) return true;     // already up: keep its timer and arming
+    // The whole command must be readable: a cut-off tail could be the part
+    // that matters. Too long for the box: no card, the terminal decides.
+    if (!text || strlen(text) > TEXT_MAX) return false;
+    lv_point_t sz;
+    lv_text_get_size(&sz, text, lv_obj_get_style_text_font(lbl_text, LV_PART_MAIN), 0, 0, text_box_w, LV_TEXT_FLAG_NONE);
+    if (sz.y > text_box_h || sz.x > text_box_w) return false;
     char buf[TEXT_MAX + 4];
     copy_utf8(buf, sizeof buf, tool, 31);
     lv_label_set_text(lbl_tool, buf[0] ? buf : "use a tool");
@@ -203,6 +212,7 @@ void perm_show(uint32_t id, const char* tool, const char* text, uint32_t timeout
     lv_obj_clear_flag(root, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(root);
     shown = true;
+    return true;
 }
 
 static void do_hide(void) {

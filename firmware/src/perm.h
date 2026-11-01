@@ -8,7 +8,9 @@
 // over the timeout. Everything is created once in perm_init(); show/hide only
 // restyle. Taps are routed by the caller through perm_hit().
 void perm_init(lv_obj_t* parent);          // builds it hidden, once after ui_init (NULL = layer top)
-void perm_show(uint32_t id, const char* tool, const char* text, uint32_t timeout_ms);  // replaces any shown one
+// Replaces any shown card. False = not shown (no id, or the command doesn't
+// fit the card whole): tell the host with ble_send_perm_skip().
+bool perm_show(uint32_t id, const char* tool, const char* text, uint32_t timeout_ms);
 void perm_hide(uint32_t id);               // withdraws it if that id is shown (id 0 = any)
 bool perm_visible(void);
 // A tap while visible, in screen px: 1 = Allow hit, 2 = Deny hit, 0 = elsewhere (ignore).

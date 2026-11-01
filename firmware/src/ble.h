@@ -26,7 +26,8 @@ bool ble_has_data(void);
 const char* ble_get_data(void);
 void ble_send_ack(void);
 void ble_send_nack(void);
-void ble_send_perm(uint32_t id, bool allow);   // TX {"perm":id,"allow":..}: a permission request answered here
+void ble_send_perm(uint32_t id, bool allow);
+void ble_send_perm_skip(uint32_t id);   // TX {"perm":id,"skip":true}: the card can't show it whole   // TX {"perm":id,"allow":..}: a permission request answered here
 void ble_send_dismiss(void);   // TX {"dismiss":true}: the user ended the alert on the device
 void ble_request_refresh(void);
 

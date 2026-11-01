@@ -576,6 +576,17 @@ void ble_send_nack(void) {
     }
 }
 
+// The card couldn't show request `id` whole: the host hands it back to the terminal.
+void ble_send_perm_skip(uint32_t id) {
+    if (state == BLE_STATE_CONNECTED && tx_char) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "{\"perm\":%lu,\"skip\":true}", (unsigned long)id);
+        tx_char->setValue(buf);
+        tx_char->notify();
+        Serial.printf("BLE: permission %lu too long for the card\n", (unsigned long)id);
+    }
+}
+
 void ble_send_perm(uint32_t id, bool allow) {
     if (state == BLE_STATE_CONNECTED && tx_char) {
         char buf[48];
