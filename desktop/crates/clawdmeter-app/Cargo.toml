@@ -19,6 +19,7 @@ path = "src/main.rs"
 clawdmeter-core.workspace = true
 clawdmeter-ble.workspace = true
 clawdmeter-flash.workspace = true
+clawdmeter-relay.workspace = true
 tokio.workspace = true
 log.workspace = true
 chrono.workspace = true

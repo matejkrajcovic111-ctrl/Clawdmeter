@@ -235,7 +235,7 @@ impl SetupView {
             .gap(px(16.))
             .pt(px(24.))
             .child(clawd(7.))
-            .child(Self::title("Set up Clawdmeter"))
+            .child(Self::title("Set up Clawdmeter2"))
             .child(div().max_w(px(460.)).text_center().child(para(
                 t,
                 "See your Claude Code usage on your desk. Clawd reacts to activity and alerts you when a session \
@@ -280,7 +280,7 @@ impl SetupView {
             (false, false) => notice(
                 t,
                 Tone::Plain,
-                "The background process isn't running. Pair the device, then start Clawdmeter to check the connection.",
+                "The background process isn't running. Pair the device, then start Clawdmeter2 to check the connection.",
             )
             .w(px(520.))
             .into_any_element(),
@@ -318,7 +318,8 @@ impl SetupView {
             div().flex().justify_center().child(div().max_w(px(520.)).text_center().child(para(
                 t,
                 "Hooks let Clawd react to activity and show alerts. They store event metadata locally, plus \
-                     notification or question text for alerts.",
+                     notification or question text for alerts. Installing also sets Claude Code's status line to \
+                     Clawdmeter2's live usage (a status line you have keeps showing).",
             ))),
         );
         // Only every account installed skips the list; an unreadable one
@@ -375,7 +376,7 @@ impl SetupView {
         let after = match (self.running, self.windowed) {
             (false, _) => None,
             (true, true) => Some("Keep this window open to update usage."),
-            (true, false) => Some("Clawdmeter keeps running in the tray. Open it there to view usage or settings."),
+            (true, false) => Some("Clawdmeter2 keeps running in the tray. Open it there to view usage or settings."),
         };
         div()
             .flex()
@@ -499,7 +500,7 @@ impl Render for SetupView {
             Step::Done => right.child(button(
                 &t,
                 "setup-finish",
-                "Open Clawdmeter",
+                "Open Clawdmeter2",
                 ButtonKind::Primary,
                 true,
                 cx.listener(|v, _, _, cx| v.finish(cx)),

@@ -9,6 +9,7 @@
 
 #![warn(missing_docs)]
 
+pub mod accounts;
 pub mod art;
 pub mod boards;
 pub mod chime;
@@ -19,6 +20,9 @@ pub mod hooks;
 pub mod ipc;
 pub mod logger;
 pub mod onboarding;
+pub mod permission;
+pub mod relay_server;
+pub mod statusline;
 pub mod tray;
 pub mod ui;
 

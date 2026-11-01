@@ -4,15 +4,21 @@
 #include "mascot.h"
 #include "performer.h"
 #include "face.h"
+#include "pet.h"
 #include "ui.h"
 #include "idle.h"
 #include "minimal_mode.h"
 #include "hal/board_caps.h"
 #include "usage_rate.h"
+#include "accounts.h"
 #include <Arduino.h>
 #include <lvgl.h>
 #include <string.h>
 #include <stdlib.h>
+#include "savers.h"
+// party.cpp (kept out of party.h's LVGL types for the native tests)
+void party_confetti(void);
+void party_glow_rgb(uint32_t rgb, int pulses);
 
 // ─── Beats ───────────────────────────────────────────────────────────────────
 // Each beat is a short script of steps. A step issues commands to the actors
@@ -29,9 +35,10 @@ enum Beat {
     B_RUN_HOME,      // the performance stops, he runs off, the corner walks home
     B_ATTENTION,     // the big Clawd fetches you
     B_PEEK,          // a tap on the meters: hop, duck out, the face comes up curious for a while
+    B_PET,           // clawdmeter2: a tap on the title: he ducks out, the face comes up to be petted (pet.h)
 };
 static const char* const BEAT_NAMES[] = {
-    "home", "corner", "show", "screensaver", "face-home", "run-home", "attention", "peek",
+    "home", "corner", "show", "screensaver", "face-home", "run-home", "attention", "peek", "pet",
 };
 
 static Beat     beat = B_HOME;
@@ -72,11 +79,24 @@ static ClawdRng    rng;
 // A tap on the meters (the aquarium)
 static int         peek_x = 0;                // where the peek's tap landed
 static uint32_t    peek_up_at = 0;            // the peek's face started rising
-static lv_indev_t* touch_indev = NULL;
 
 static uint32_t now_ms(void) { return millis(); }
 
+// clawdmeter2: screensaver styles take turns: 0 = the classic face (with calm
+// dips), 1..SAVER_COUNT = a full-screen effect (savers.cpp), which itself
+// changes every SAVER_SWITCH_MS while it runs.
+#define SAVER_SWITCH_MS (4u * 60u * 1000u)
+static int      saver_style = 0;
+static int      saver_turn = 0;
+static uint32_t saver_since = 0;
+
 static void go(Beat b) {
+    if (beat == B_PET && b != B_PET) pet_leave();   // props off, eyes back, before the face drops
+    if (beat == B_SCREENSAVER && b != B_SCREENSAVER && saver_active()) saver_stop();
+    if (b == B_SCREENSAVER && beat != B_SCREENSAVER) {
+        saver_style = saver_turn;
+        saver_turn = (saver_turn + 1) % (SAVER_COUNT + 1);
+    }
     if (b != beat) Serial.printf("[%lu] director: %s -> %s\n", (unsigned long)now_ms(),
                                  BEAT_NAMES[beat], BEAT_NAMES[b]);
     beat = b;
@@ -145,6 +165,11 @@ static void to_meters(bool noticed) {
         go(B_FACE_HOME);
     } else if (performing) {
         go(B_RUN_HOME);
+    } else if (beat == B_SCREENSAVER && saver_style > 0) {
+        // An effect screensaver: it goes, he comes back to his seat.
+        if (attention_on) { go(B_ATTENTION); return; }
+        mascot_return(-1, 150);
+        go(B_CORNER);
     } else if (beat == B_SHOW || beat == B_SCREENSAVER) {
         // Still on the meters (pointing / walking off): turn around.
         if (attention_on) { go(B_ATTENTION); return; }
@@ -254,6 +279,7 @@ void director_tap(int x) {
         tap_home(x);
         return;
     }
+    if (beat == B_PET) return;   // the pet's own taps go to pet_tap (main.cpp); before it's up, absorbed
     if (beat == B_PEEK) {
         // The face is up (or coming up) looking at you: he blinks and drops
         // right away. Before it shows (hop, ducking out) the tap is
@@ -276,8 +302,70 @@ bool director_button(bool main_button) {
         return true;
     }
     resume_screensaver = false;
-    if (beat == B_SCREENSAVER) to_meters(false);
+    if (beat == B_SCREENSAVER || beat == B_PET) to_meters(false);
     return false;
+}
+
+// ─── Pet mode (clawdmeter2) ──────────────────────────────────────────────────
+// A tap on the title. One Clawd: the corner Clawd ducks out first, then the
+// face comes up and pet.cpp has it until you swipe, it gets left alone long
+// enough, or something outranks it (attention, the link dropping).
+bool director_pet(void) {
+    engage();
+    if (minimal || pairing_touch || attention_on) return false;
+    if (beat != B_HOME && beat != B_CORNER) return false;
+    react_anim = NULL;
+    mascot_leave(PEEK_LEAVE_PCT);
+    go(B_PET);
+    return true;
+}
+
+bool director_in_pet(void) { return beat == B_PET && pet_active(); }
+
+// Plain meters: no alert, show, screensaver or transition going on, so a tap
+// on a card can open its history instead of meaning "you're here".
+bool director_meters_quiet(void) { return (beat == B_HOME || beat == B_CORNER) && !attention_on; }
+
+// clawdmeter2: the cards stay tappable while an ambient show runs or ends
+// (Clawd is just performing on the meters); only alerts, the screensaver, the
+// face and pet mode keep a tap meaning "you're here".
+bool director_cards_tappable(void) {
+    if (attention_on) return false;
+    return beat == B_HOME || beat == B_CORNER || beat == B_SHOW || beat == B_RUN_HOME;
+}
+
+// Stops a running show so a history screen can take the meters.
+void director_end_show(void) {
+    if (beat == B_SHOW) { engage(); to_meters(false); }
+}
+
+void director_pet_exit(void) {
+    engage();
+    if (beat == B_PET) to_meters(false);
+}
+
+static void run_pet(uint32_t now) {
+    if (!ui_meters_live()) { to_meters(false); return; }   // link dropped: show the hint
+    switch (step) {
+    case 0:   // he's ducking out
+        if (!settled(now) || !mascot_away()) return;
+        face_set_tint(ui_account_palette() == 2);   // while hidden: no repaint
+        face_rise();
+        next_step();
+        break;
+    case 1:   // up and settled: the pet takes over
+        if (!settled(now)) return;
+        pet_enter();
+        next_step();
+        break;
+    default:
+        pet_tick(now);
+        if (pet_done(now)) {
+            Serial.printf("[%lu] director: pet over (left alone)\n", (unsigned long)now);
+            to_meters(false);
+        }
+        break;
+    }
 }
 
 void director_set_attn_anim(int seconds) {
@@ -293,15 +381,15 @@ void director_set_liveliness(int level) {
     mascot_autonomy(beat == B_HOME && !minimal && t.idle_acts);
 }
 
-static void indev_cb(lv_event_t* e) {
-    (void)e;
-    lv_point_t p = { 0, 0 };
-    if (touch_indev) lv_indev_get_point(touch_indev, &p);
-    director_tap(p.x);
-}
+// clawdmeter2: which account the latest payload's events belong to. Each
+// account has its own Clawd (mascot.cpp): events of the account on screen play
+// here as always; the other account's go to his Clawd off screen.
+static int event_acct = 1;
+static bool for_shown(void) { return accounts_count() < 2 || event_acct == accounts_shown(); }
 
 void director_on_payload(const UsageData* d, const SignalsUpdate* sig) {
     if (!d->valid || !d->ok) return;
+    event_acct = d->account_idx >= 1 ? d->account_idx : 1;
     window_not_started = !d->enterprise && d->session_reset_mins < 0;
 
     // The slow clock moving counts as you being around.
@@ -314,7 +402,12 @@ void director_on_payload(const UsageData* d, const SignalsUpdate* sig) {
         last_pct = d->session_pct;
     }
 
-    if (sig->session_reset && !minimal && clawd_tuning().reactions) {
+    // clawdmeter2: reset party, confetti over the meters (pet mode has its own).
+    if (sig->session_reset && for_shown() && !minimal && beat != B_PET) party_confetti();
+    if (sig->session_reset && !for_shown()) {
+        if (!minimal && clawd_tuning().reactions) mascot_hidden_act("jumping happy");
+    } else if (sig->session_reset && beat == B_PET) pet_celebrate();   // confetti, he's up anyway
+    else if (sig->session_reset && !minimal && clawd_tuning().reactions) {
         // Fresh window: jumping happy twice, the same moment as the chime if
         // he's home, else when he gets back. Never on replays (signals only
         // reports real samples). It outranks the notice / wave below.
@@ -334,18 +427,33 @@ void director_on_payload(const UsageData* d, const SignalsUpdate* sig) {
             resume_screensaver = false;       // you're back
             if (beat == B_SCREENSAVER) {
                 to_meters(true);              // he notices, the face drops
+            } else if (!for_shown()) {
+                mascot_hidden_act("pointing");   // the other account's Clawd
             } else {
                 // Anticipation: he turns and points before anything else.
                 react("pointing", 1);
             }
         } else if (sig->event == 's' && wave) {
-            react("waving", 1);
+            if (for_shown()) react("waving", 1);
+            else             mascot_hidden_act("waving");
+        } else if (sig->event == 't' || sig->event == 'f') {
+            // clawdmeter2: tests passed (a fanfare) or failed (he goes
+            // looking for the bug), with a green / red edge glow.
+            const bool pass = sig->event == 't';
+            if (for_shown()) {
+                react(pass ? "trumpet" : "magnifier", 1);
+                party_glow_rgb(pass ? 0x4CAF50 : 0xE5484D, 1);
+            } else {
+                mascot_hidden_act(pass ? "trumpet" : "magnifier");
+            }
         }
     }
 }
 
 // ─── Minimal mode ────────────────────────────────────────────────────────────
 static void apply_minimal(bool on) {
+    if (beat == B_PET) pet_leave();           // props off (go() is skipped below)
+    if (saver_active()) saver_stop();         // an effect screensaver goes too
     minimal = on;
     react_anim = NULL;                        // a queued corner reaction is moot now
     resume_screensaver = false;
@@ -365,16 +473,15 @@ static void apply_minimal(bool on) {
 // ─── Init ────────────────────────────────────────────────────────────────────
 void director_init(void) {
     face_init();
+    pet_init();          // its props sit over the face
     show_gate_clear(&show_gate);
     turn_clear(&turn);
     clawd_rng_seed(&rng, now_ms() ^ 0xD1EC7u);
     last_engagement = now_ms();
     apply_minimal(minimal_mode());
     go(B_HOME);
-    // Every press on the panel, wherever it lands, is a tap for the
-    // director. PRESSED (not CLICKED) so the reaction starts on the next frame.
-    touch_indev = lv_indev_get_next(NULL);
-    if (touch_indev) lv_indev_add_event_cb(touch_indev, indev_cb, LV_EVENT_PRESSED, NULL);
+    // Taps reach the director from main.cpp's gesture router (gesture.h), on
+    // the release, so a swipe between accounts isn't also a tap.
 }
 
 DirectorRoom director_room(void) { return face_visible() ? ROOM_FACE : ROOM_METERS; }
@@ -447,9 +554,31 @@ static void run_show(uint32_t now) {
 
 static uint32_t calm_at = 0;
 
+// An effect screensaver: he leaves, the effect runs, changing now and then.
+static void run_effect_saver(uint32_t now) {
+    if (step == 0) {
+        mascot_leave(100);
+        next_step();
+        return;
+    }
+    if (step == 1) {
+        if (!mascot_away()) return;
+        saver_start(saver_style - 1);
+        saver_since = now;
+        step = 2;
+        return;
+    }
+    if ((uint32_t)(now - saver_since) >= SAVER_SWITCH_MS) {
+        saver_style = saver_style % SAVER_COUNT + 1;   // the next effect
+        saver_start(saver_style - 1);
+        saver_since = now;
+    }
+}
+
 static void run_screensaver(uint32_t now) {
     const ClawdTuning& t = clawd_tuning();
     if (!ui_meters_live()) { to_meters(false); return; }   // link dropped: show the hint
+    if (saver_style > 0) { run_effect_saver(now); return; }
     if (step == 3) {
         // Resting: dip into a calm performance now and then (also breaks up
         // the flat orange field for burn-in). One Clawd: the face drops onto
@@ -648,7 +777,8 @@ static void run_home(uint32_t now) {
     const bool live = ui_meters_live();
     QuietInput q = { now, last_engagement, signals_hooks_seen(), window_not_started, live };
     if (screensaver_ready(&q, &clawd_tuning())) { go(B_SCREENSAVER); return; }
-    if (live && signals_hooks_seen() && show_gate_ready(&show_gate, now, &clawd_tuning()))
+    // A show is the busy account's treat: only while that account is on screen.
+    if (live && for_shown() && signals_hooks_seen() && show_gate_ready(&show_gate, now, &clawd_tuning()))
         go(B_SHOW);
 }
 
@@ -669,6 +799,7 @@ void director_tick(void) {
     case B_RUN_HOME:    run_run_home(now); break;
     case B_ATTENTION:   run_attention(now); break;
     case B_PEEK:        run_peek(now); break;
+    case B_PET:         run_pet(now); break;
     }
 }
 
@@ -697,6 +828,7 @@ bool director_debug(const char* name) {
         tap_home(x);
         return beat == B_PEEK;
     }
+    if (strcmp(name, "pet") == 0) return director_pet();   // as a tap on the title would
     if (strcmp(name, "lurk") == 0) {      // a lurk trip now (to QA cutting it short)
         if (beat != B_HOME) return false;
         return mascot_lurk();

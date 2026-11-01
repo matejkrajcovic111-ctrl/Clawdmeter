@@ -77,6 +77,10 @@ bool mascot_act(const char*, uint8_t times, bool, uint16_t speed_pct) {
     return true;
 }
 
+// The other account's Clawd (off screen): only counted, nothing on stage moves.
+int fake_hidden_acts = 0;
+void mascot_hidden_act(const char*) { fake_hidden_acts++; }
+
 void mascot_leave(uint16_t spd) {
     if (m_minimal || m_mode == M_AWAY) return;
     if (m_mode == M_LURK) { m_stay_away = true; return; }
@@ -226,6 +230,28 @@ bool face_busy(void) { return face_moving() || !done(f_busy_until); }
 void face_blink(bool twice) { f_busy_until = now() + (twice ? 500 : 250); }
 void face_set_resting(bool) {}
 void face_look_at_x(int, uint32_t hold_ms) { f_busy_until = now() + hold_ms + 300; }
+void face_set_tint(bool) {}
+
+// ─── Pet (pet.h, clawdmeter2) ────────────────────────────────────────────────
+static bool     pet_on = false;
+static uint32_t pet_since = 0;
+void pet_init(void) {}
+void pet_enter(void) { pet_on = true; pet_since = now(); }
+void pet_leave(void) { pet_on = false; }
+bool pet_active(void) { return pet_on; }
+void pet_tick(uint32_t) {}
+bool pet_done(uint32_t t) { return pet_on && t - pet_since >= 20000; }   // left alone 20 s
+void pet_celebrate(void) {}
+void party_confetti(void) {}
+void saver_init(void*) {}
+void saver_start(int) {}
+void saver_stop(void) {}
+bool saver_active(void) { return false; }
+int  saver_kind(void) { return -1; }
+const char* saver_name(int) { return ""; }
+void saver_tick(void) {}
+void party_glow_rgb(uint32_t, int) {}
+int  ui_account_palette(void) { return 1; }
 
 // ─── The situation ───────────────────────────────────────────────────────────
 bool ui_meters_live(void) { return world.meters_live; }

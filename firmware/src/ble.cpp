@@ -4,7 +4,7 @@
 #include <NimBLEHIDDevice.h>
 #include <Preferences.h>
 
-#define DEVICE_NAME "Clawdmeter"
+#define DEVICE_NAME "Clawdmeter2"
 
 // Custom GATT UUIDs for data channel
 #define SERVICE_UUID        "4c41555a-4465-7669-6365-000000000001"
@@ -12,7 +12,7 @@
 #define TX_CHAR_UUID        "4c41555a-4465-7669-6365-000000000003"  // device ack/nack notifies
 #define REQ_CHAR_UUID       "4c41555a-4465-7669-6365-000000000004"  // device-initiated refresh request
 
-#define BLE_BUF_SIZE 512
+#define BLE_BUF_SIZE 768   // a full history message (30 + 24 numbers + a joke) fits
 
 // HID keyboard report descriptor (standard 6-KRO boot-protocol-compatible).
 // Includes the LED output report (Num/Caps/Scroll Lock indicators) — without
@@ -72,58 +72,107 @@ static const uint16_t DESIRED_TIMEOUT   = 600;   // ×10ms = 6s, matches PPCP
 static volatile uint16_t param_fix_handle = CONN_HANDLE_NONE;  // pending retry
 static volatile uint32_t param_fix_at_ms  = 0;                 // when to send it
 static volatile uint16_t param_fix_spent  = CONN_HANDLE_NONE;  // one per connection
-// RX writes land in rx_buf on the NimBLE host task (core 0); the loop parses
-// on core 1. Both sides copy under rx_lock, and the loop parses its own copy
-// (parse_buf), so a write never changes the text mid-parse.
-static char rx_buf[BLE_BUF_SIZE];
+// RX writes land in a small queue on the NimBLE host task (core 0); the loop
+// parses on core 1, one message per pass. Both sides copy under rx_lock, and
+// the loop parses its own copy (parse_buf), so a write never changes the text
+// mid-parse. clawdmeter2: a queue, not one slot: the app sends a permission
+// card and a usage payload back to back, and one slot lost the first.
+#define RX_SLOTS 4
+static char rx_ring[RX_SLOTS][BLE_BUF_SIZE];
+static uint8_t rx_head = 0, rx_tail = 0;   // write / read positions; equal = empty
 static char parse_buf[BLE_BUF_SIZE];
 static portMUX_TYPE rx_lock = portMUX_INITIALIZER_UNLOCKED;
-static volatile bool data_ready = false;
 static volatile bool has_received_data = false;
 static char mac_str[18];
 
-// --- Single-owner lock -----------------------------------------------------
+// --- Owner lock (clawdmeter2: several owners) ------------------------------
 //
 // The board is a BLE peripheral that any central in range could connect to and
-// write usage data to. To stop the display rotating to another machine's
-// account, it locks to ONE owner: the identity address of the machine it is
-// bonded to, persisted in NVS. Only that owner (over a bonded+encrypted link)
-// may write usage data; a second machine that pairs is rejected so the board
-// stays paired to a single machine. The hold-power bond-clear gesture resets
-// the owner so the board can be handed to a different machine.
+// write usage data to. To stop a stranger's machine writing to it, only its
+// OWNERS may: the identity addresses of up to OWNERS_MAX machines (e.g. a
+// workstation at home and a laptop at work), persisted in NVS. The first
+// machine to pair becomes an owner; another one joins only while the pairing
+// window is open (ble_open_pairing: the PWR hold gesture). A full list drops
+// its oldest owner for the new one. Anyone else that pairs is un-bonded and
+// dropped. Clearing the bonds forgets every owner.
+#define OWNERS_MAX 3
 static Preferences prefs;
-static char owner_addr[18] = {0};   // owner identity address, e.g. "aa:bb:cc:dd:ee:ff"
-static bool owner_set = false;
+static char owners[OWNERS_MAX][18] = {};   // identity addresses, "aa:bb:cc:dd:ee:ff"
+static int  owner_count = 0;
+static bool owner_set = false;             // owner_count > 0
 static const char* ZERO_ADDR = "00:00:00:00:00:00";
+static volatile uint32_t pairing_until_ms = 0;   // window for a new owner; 0 = closed
 
-static void save_owner() {
+static bool pairing_open() {
+    const uint32_t until = pairing_until_ms;
+    if (until == 0) return false;
+    if ((int32_t)(until - millis()) > 0) return true;
+    // Expired: close it for good, or the wrapped comparison would reopen it
+    // ~24.8 days later.
+    pairing_until_ms = 0;
+    return false;
+}
+
+static bool is_owner(const char* id) {
+    for (int i = 0; i < owner_count; i++)
+        if (strcmp(owners[i], id) == 0) return true;
+    return false;
+}
+
+static void save_owners() {
+    String all;
+    for (int i = 0; i < owner_count; i++) {
+        if (i) all += ",";
+        all += owners[i];
+    }
     prefs.begin("clawd", false);
-    prefs.putString("owner", owner_addr);
+    prefs.putString("owners", all);
+    prefs.remove("owner");   // the single-owner key of older firmware
     prefs.end();
 }
 
 static void clear_owner() {
+    owner_count = 0;
     owner_set = false;
-    owner_addr[0] = '\0';
     prefs.begin("clawd", false);
     prefs.remove("owner");
+    prefs.remove("owners");
     prefs.end();
+}
+
+static void add_owner_addr(const char* id) {
+    if (strlen(id) != 17 || is_owner(id)) return;
+    if (owner_count == OWNERS_MAX) {           // drop the oldest; its bond goes in prune_foreign_bonds()
+        Serial.printf("BLE: owner list full, dropping %s\n", owners[0]);
+        for (int i = 1; i < OWNERS_MAX; i++) memcpy(owners[i - 1], owners[i], 18);
+        owner_count--;
+    }
+    memcpy(owners[owner_count], id, 17);
+    owners[owner_count][17] = '\0';
+    owner_count++;
+    owner_set = true;
 }
 
 static void load_owner() {
     prefs.begin("clawd", true);
-    String o = prefs.getString("owner", "");
+    String all = prefs.getString("owners", "");
+    String legacy = prefs.getString("owner", "");
     prefs.end();
-    if (o.length() == 17) {  // "aa:bb:cc:dd:ee:ff"
-        strncpy(owner_addr, o.c_str(), sizeof(owner_addr) - 1);
-        owner_addr[sizeof(owner_addr) - 1] = '\0';
-        owner_set = true;
-        Serial.printf("BLE: owner loaded = %s\n", owner_addr);
+    owner_count = 0;
+    int start = 0;
+    while (start < (int)all.length()) {
+        int comma = all.indexOf(',', start);
+        if (comma < 0) comma = all.length();
+        add_owner_addr(all.substring(start, comma).c_str());
+        start = comma + 1;
     }
+    if (legacy.length() == 17) add_owner_addr(legacy.c_str());
+    owner_set = owner_count > 0;
+    for (int i = 0; i < owner_count; i++) Serial.printf("BLE: owner loaded = %s\n", owners[i]);
 }
 
-// Delete every stored bond that isn't the owner, so the board stays paired to
-// exactly one machine. Removing a bond shifts the indices, so restart from 0.
+// Delete every stored bond that isn't an owner. Removing a bond shifts the
+// indices, so restart from 0.
 static void prune_foreign_bonds() {
     if (!owner_set) return;
     bool removed;
@@ -132,7 +181,7 @@ static void prune_foreign_bonds() {
         int n = NimBLEDevice::getNumBonds();
         for (int i = 0; i < n; i++) {
             NimBLEAddress a = NimBLEDevice::getBondedAddress(i);
-            if (strcmp(a.toString().c_str(), owner_addr) != 0) {
+            if (!is_owner(a.toString().c_str())) {
                 Serial.printf("BLE: pruning non-owner bond %s\n", a.toString().c_str());
                 NimBLEDevice::deleteBond(a);
                 removed = true;
@@ -143,20 +192,24 @@ static void prune_foreign_bonds() {
 }
 
 static void claim_owner(const std::string& id) {
-    strncpy(owner_addr, id.c_str(), sizeof(owner_addr) - 1);
-    owner_addr[sizeof(owner_addr) - 1] = '\0';
-    owner_set = true;
-    save_owner();
-    Serial.printf("BLE: owner claimed = %s\n", owner_addr);
+    add_owner_addr(id.c_str());
+    save_owners();
+    pairing_until_ms = 0;                      // one new computer per window
+    Serial.printf("BLE: owner added = %s (%d owners)\n", id.c_str(), owner_count);
     prune_foreign_bonds();
+}
+
+// A machine that just authenticated or wrote: may it become an owner?
+static bool may_claim(const std::string& id) {
+    return id != ZERO_ADDR && !is_owner(id.c_str()) && (!owner_set || pairing_open());
 }
 
 static void start_advertising() {
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
     adv->reset();
     // Primary advertising packet (≤31 bytes):
-    //   flags (3) + appearance (4) + HID service 0x1812 (4) + name "Clawdmeter" (12)
-    //   = 23 bytes. macOS Bluetooth Settings only surfaces BLE-only devices
+    //   flags (3) + appearance (4) + HID service 0x1812 (4) + name "Clawdmeter2" (13)
+    //   = 24 bytes. macOS Bluetooth Settings only surfaces BLE-only devices
     //   that explicitly advertise the standard HID service UUID (0x1812) —
     //   without it the device is recognized internally but hidden from the
     //   GUI nearby-devices list.
@@ -185,8 +238,8 @@ static void start_advertising() {
 class ServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* s, NimBLEConnInfo& info) override {
         state = BLE_STATE_CONNECTED;
-        Serial.printf("BLE: connected from %s (active=%u)\n",
-            info.getAddress().toString().c_str(),
+        Serial.printf("BLE: [%lu ms] connected from %s (active=%u)\n",
+            (unsigned long)millis(), info.getAddress().toString().c_str(),
             (unsigned)s->getConnectedCount());
         // Log negotiated link timing — the difference between guessing and
         // knowing when debugging disconnects (e.g. reason=520 supervision
@@ -206,7 +259,14 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         // to pair; macOS can keep a cached GATT table after a bond clear and
         // never read a protected HID characteristic, leaving it stuck on
         // "Connecting" with an unencrypted link.
-        if (!info.isEncrypted()) {
+        // Only for peers we have NO bond with: on a bonded reconnect the
+        // central (Windows) starts encryption itself, and our extra Security
+        // Request overlapping it broke the link (enc=0, reason=520) after
+        // every board reboot until the user re-paired.
+        bool known = NimBLEDevice::isBonded(info.getIdAddress()) ||
+                     NimBLEDevice::isBonded(info.getAddress());
+        Serial.printf("BLE: peer bonded-before=%d enc=%d\n", known ? 1 : 0, info.isEncrypted() ? 1 : 0);
+        if (!info.isEncrypted() && !known) {
             int rc = 0;
             bool ok = NimBLEDevice::startSecurity(info.getConnHandle(), &rc);
             Serial.printf("BLE: startSecurity %s (rc=%d)\n", ok ? "OK" : "FAILED", rc);
@@ -221,8 +281,8 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         // reuses conn handles, so stale state would leak onto the next link.
         if (param_fix_handle == info.getConnHandle()) param_fix_handle = CONN_HANDLE_NONE;
         if (param_fix_spent  == info.getConnHandle()) param_fix_spent  = CONN_HANDLE_NONE;
-        Serial.printf("BLE: disconnected (reason=%d, remaining=%u)\n",
-            reason, (unsigned)s->getConnectedCount());
+        Serial.printf("BLE: [%lu ms] disconnected (reason=%d, remaining=%u)\n",
+            (unsigned long)millis(), reason, (unsigned)s->getConnectedCount());
     }
 
     // Centrals re-negotiate parameters mid-connection. Windows in particular
@@ -252,8 +312,10 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // so the board never shows (or rotates to) a second machine's account.
     void onAuthenticationComplete(NimBLEConnInfo& info) override {
         std::string id = info.getIdAddress().toString();
-        Serial.printf("BLE: auth complete peer=%s bonded=%d enc=%d\n",
-            id.c_str(), info.isBonded() ? 1 : 0, info.isEncrypted() ? 1 : 0);
+        Serial.printf("BLE: [%lu ms] auth complete peer=%s conn=%s bonded=%d enc=%d auth=%d\n",
+            (unsigned long)millis(), id.c_str(), info.getAddress().toString().c_str(),
+            info.isBonded() ? 1 : 0, info.isEncrypted() ? 1 : 0,
+            info.isAuthenticated() ? 1 : 0);
         // Bonded reconnects START at the central's clamped parameters (no
         // later update event fires), so the supervision-timeout pushback must
         // also arm here, not just in onConnParamsUpdate.
@@ -263,10 +325,10 @@ class ServerCallbacks : public NimBLEServerCallbacks {
             param_fix_at_ms  = millis() + 2000;
         }
         if (id == ZERO_ADDR) return;
-        if (!owner_set) {
+        if (may_claim(id)) {
             claim_owner(id);
-        } else if (strcmp(id.c_str(), owner_addr) != 0) {
-            Serial.printf("BLE: rejecting non-owner %s (owner=%s)\n", id.c_str(), owner_addr);
+        } else if (!is_owner(id.c_str())) {
+            Serial.printf("BLE: rejecting non-owner %s (%d owners, pairing closed)\n", id.c_str(), owner_count);
             NimBLEDevice::deleteBond(info.getIdAddress());
             server->disconnect(info);
         }
@@ -285,19 +347,20 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
             Serial.println("BLE: dropping RX write from unencrypted link");
             return;
         }
-        if (!owner_set && id != ZERO_ADDR) {
+        if (may_claim(id)) {
             claim_owner(id);
         }
-        if (owner_set && strcmp(id.c_str(), owner_addr) != 0) {
+        if (owner_set && !is_owner(id.c_str())) {
             Serial.printf("BLE: dropping RX write from non-owner %s\n", id.c_str());
             return;
         }
         std::string val = chr->getValue();
         size_t len = std::min(val.length(), (size_t)(BLE_BUF_SIZE - 1));
         portENTER_CRITICAL(&rx_lock);
-        memcpy(rx_buf, val.c_str(), len);
-        rx_buf[len] = '\0';
-        data_ready = true;
+        memcpy(rx_ring[rx_head], val.c_str(), len);
+        rx_ring[rx_head][len] = '\0';
+        rx_head = (uint8_t)((rx_head + 1) % RX_SLOTS);
+        if (rx_head == rx_tail) rx_tail = (uint8_t)((rx_tail + 1) % RX_SLOTS);   // full: drop the oldest
         portEXIT_CRITICAL(&rx_lock);
         has_received_data = true;
     }
@@ -318,6 +381,10 @@ class ReqCallbacks : public NimBLECharacteristicCallbacks {
 void ble_init(void) {
     NimBLEDevice::init(DEVICE_NAME);
     NimBLEDevice::setSecurityAuth(true, false, true);  // bonding, no MITM, SC
+    // Exchange identity keys too, so a bonded central using a private
+    // address is still recognised after the board reboots.
+    NimBLEDevice::setSecurityInitKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
+    NimBLEDevice::setSecurityRespKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
 
     // Restore the locked owner (if any) and drop any stale non-owner bonds so
     // the board stays paired to a single machine across reboots.
@@ -338,7 +405,7 @@ void ble_init(void) {
     // --- HID keyboard service ---
     hid_dev = new NimBLEHIDDevice(server);
     hid_dev->setReportMap((uint8_t*)HID_REPORT_MAP, sizeof(HID_REPORT_MAP));
-    hid_dev->setManufacturer("Clawdmeter");
+    hid_dev->setManufacturer("Clawdmeter2");
     // PnP ID: (vendorIdSource, vendorId, productId, version).
     // Source 1 = Bluetooth SIG, vendor 0x02E5 = Espressif. Don't claim
     // Apple's IDs (USB vendor 0x05AC): macOS validates Apple-claimed HIDs
@@ -434,16 +501,17 @@ void ble_clear_bonds(void) {
     }
     clear_owner();  // release ownership so the board can be handed to another machine
     Serial.printf("BLE: bonds cleared (remaining=%d)\n", NimBLEDevice::getNumBonds());
-    if (state == BLE_STATE_CONNECTED) {
-        server->disconnect(server->getPeerInfo(0).getConnHandle());
-    }
+    // Every link, not just the first: a second one would still be encrypted
+    // and could claim the board again with its next write.
+    if (state == BLE_STATE_CONNECTED) ble_disconnect_all();
     need_advertise = true;
 }
 
 void ble_print_status(void) {
     static const char* names[] = {"INIT", "ADVERTISING", "CONNECTED", "DISCONNECTED"};
-    Serial.printf("BLE status: state=%s bonds=%d owner=%s\n",
-        names[state], NimBLEDevice::getNumBonds(), owner_set ? owner_addr : "none");
+    Serial.printf("BLE status: state=%s bonds=%d owners=%d pairing=%s\n",
+        names[state], NimBLEDevice::getNumBonds(), owner_count, pairing_open() ? "open" : "closed");
+    for (int i = 0; i < owner_count; i++) Serial.printf("BLE status: owner=%s\n", owners[i]);
     if (!server) return;
     for (uint8_t i = 0; i < server->getConnectedCount(); i++) {
         NimBLEConnInfo ci = server->getPeerInfo(i);
@@ -452,6 +520,17 @@ void ble_print_status(void) {
             ci.isEncrypted() ? 1 : 0, ci.isBonded() ? 1 : 0);
     }
 }
+
+void ble_open_pairing(uint32_t ms) {
+    pairing_until_ms = millis() + ms;
+    if (pairing_until_ms == 0) pairing_until_ms = 1;
+    need_advertise = true;                     // a free slot advertises for the newcomer
+    Serial.printf("BLE: pairing open for %lu s (%d owners kept)\n", (unsigned long)(ms / 1000), owner_count);
+}
+
+bool ble_pairing_open(void) { return pairing_open(); }
+
+void ble_close_pairing(void) { pairing_until_ms = 0; }
 
 void ble_disconnect_all(void) {
     if (!server) return;
@@ -465,13 +544,20 @@ void ble_disconnect_all(void) {
 }
 
 bool ble_has_data(void) {
-    return data_ready;
+    portENTER_CRITICAL(&rx_lock);
+    const bool any = rx_head != rx_tail;
+    portEXIT_CRITICAL(&rx_lock);
+    return any;
 }
 
 const char* ble_get_data(void) {
     portENTER_CRITICAL(&rx_lock);
-    memcpy(parse_buf, rx_buf, sizeof(parse_buf));
-    data_ready = false;
+    if (rx_head != rx_tail) {
+        memcpy(parse_buf, rx_ring[rx_tail], sizeof(parse_buf));
+        rx_tail = (uint8_t)((rx_tail + 1) % RX_SLOTS);
+    } else {
+        parse_buf[0] = '\0';
+    }
     portEXIT_CRITICAL(&rx_lock);
     return parse_buf;
 }
@@ -487,6 +573,16 @@ void ble_send_nack(void) {
     if (state == BLE_STATE_CONNECTED && tx_char) {
         tx_char->setValue("{\"err\":true}");
         tx_char->notify();
+    }
+}
+
+void ble_send_perm(uint32_t id, bool allow) {
+    if (state == BLE_STATE_CONNECTED && tx_char) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "{\"perm\":%lu,\"allow\":%s}", (unsigned long)id, allow ? "true" : "false");
+        tx_char->setValue(buf);
+        tx_char->notify();
+        Serial.printf("BLE: permission %lu %s on the device\n", (unsigned long)id, allow ? "allowed" : "denied");
     }
 }
 

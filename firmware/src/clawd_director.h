@@ -62,6 +62,20 @@ void director_set_attn_anim(int seconds);
 // SIM_TRACE=1 for walkthrough timings). Beat changes always print.
 void director_set_trace(bool on);
 
+// clawdmeter2 pet mode (a tap on the title, pet.h). director_pet starts it
+// from the meters (false when something else is on); while
+// director_in_pet() main.cpp routes touches to pet_tap / pet_touch, and a
+// tap on the top strip or a button press (director_pet_exit) goes back to the
+// meters; a sideways drag is a stroke there, not a swipe.
+bool director_pet(void);
+bool director_in_pet(void);
+void director_pet_exit(void);
+// Home on the meters with nothing staged (no alert, show, screensaver): card
+// taps open the history screens only then.
+bool director_meters_quiet(void);
+bool director_cards_tappable(void);   // quiet, or an ambient show running / ending
+void director_end_show(void);         // stop a running show (no-op otherwise)
+
 DirectorRoom director_room(void);
 const char*  director_beat_name(void);
 

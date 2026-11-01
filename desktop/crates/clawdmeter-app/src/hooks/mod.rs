@@ -138,8 +138,35 @@ pub fn event_line(v: &Value, now_unix: u64) -> Option<String> {
     })
 }
 
+/// clawdmeter2: after a shell tool call that ran tests, a second line
+/// `<ts> TestPass|TestFail <session> [<config dir>]` (only the verdict is
+/// kept, never the command or its output).
+pub fn test_line(v: &Value, now_unix: u64) -> Option<String> {
+    if v.get("hook_event_name").and_then(Value::as_str) != Some("PostToolUse") {
+        return None;
+    }
+    let tool = v.get("tool_name").and_then(Value::as_str)?;
+    if clawdmeter_core::toolinfo::tool_code(tool) != "sh" {
+        return None;
+    }
+    let cmd = v.pointer("/tool_input/command").and_then(Value::as_str)?;
+    let r = v.get("tool_response");
+    let text = |k: &str| r.and_then(|r| r.get(k)).and_then(Value::as_str).unwrap_or("");
+    let interrupted = r.and_then(|r| r.get("interrupted")).and_then(Value::as_bool).unwrap_or(false);
+    // Some tools answer with a plain string.
+    let out = r.and_then(Value::as_str).unwrap_or_else(|| text("stdout"));
+    let passed = clawdmeter_core::toolinfo::test_outcome(cmd, out, text("stderr"), interrupted)?;
+    let mut ev = v.clone();
+    let name = if passed { clawdmeter_core::events::TEST_PASS_EVENT } else { clawdmeter_core::events::TEST_FAIL_EVENT };
+    ev["hook_event_name"] = Value::String(name.to_owned());
+    event_line(&ev, now_unix)
+}
+
 fn log_event(v: &Value, dir: &Path, now_unix: u64) -> io::Result<()> {
-    let Some(line) = event_line(v, now_unix) else { return Ok(()) };
+    let Some(mut line) = event_line(v, now_unix) else { return Ok(()) };
+    if let Some(t) = test_line(v, now_unix) {
+        line.push_str(&t);
+    }
     let f = dir.join("events.log");
     if fs::metadata(&f).is_ok_and(|m| m.is_file() && m.len() > EVENTS_ROLL_BYTES) {
         let _ = fs::rename(&f, dir.join("events.log.1"));
@@ -230,9 +257,19 @@ pub fn main(args: &[String]) -> i32 {
     if !stdin.is_terminal() {
         let _ = stdin.lock().read_to_string(&mut input);
     }
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    // clawdmeter2: the PermissionRequest hook, answered on the device. Its
+    // stdout is the decision (or nothing).
+    if args.first().map(String::as_str) == Some("permission") {
+        let state = clawdmeter_core::Paths::for_user().state_dir;
+        let out = crate::permission::run_hook(&input, &state, now as i64);
+        if !out.is_empty() {
+            println!("{out}");
+        }
+        return 0;
+    }
     if mode.action != Action::None || mode.log_too {
         let state = clawdmeter_core::Paths::for_user().state_dir;
-        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         run(mode, &input, &state, now);
     }
     0

@@ -327,7 +327,8 @@ mod tests {
         let ini = include_str!("../../../../firmware/platformio.ini");
         for line in ini.lines() {
             if let Some(env) = line.strip_prefix("[env:").and_then(|l| l.strip_suffix(']')) {
-                if env == "sim" || env == "native" {
+                // Not boards: the simulator, host tests, and dev builds of a board.
+                if env == "sim" || env == "native" || env.ends_with("_dev") {
                     continue;
                 }
                 assert!(board(env).is_some(), "{env} missing from BOARDS");

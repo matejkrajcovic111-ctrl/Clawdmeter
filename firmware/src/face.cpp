@@ -1,4 +1,5 @@
 #include "face.h"
+#include "account_tint.h"
 #include "clawd_policy.h"
 #include "theme.h"
 #include "perf.h"
@@ -61,6 +62,11 @@ static uint32_t glance_hold = 0;      // 0: a resting glance's random hold
 static uint32_t next_act_at = 0;
 static int      interest_g = 0;       // curious about a tap: resting glances go back there (px)
 static ClawdRng rng;
+
+// Pet mode (face_look_each / face_set_eye_shape): neutral when 0 / 1000.
+static int  look_dx[2] = { 0, 0 }, look_dy[2] = { 0, 0 };
+static int  shape_h_pm = 1000, shape_w_pm = 1000;
+static bool shape_bottom = false;
 
 // Last geometry handed to LVGL per eye, so an unchanged eye costs nothing.
 struct EyeBox { int x, y, w, h, ew, eh; bool solid; };   // solid: the box is exactly the open eye
@@ -149,12 +155,16 @@ static void apply_eyes(void) {
     face_eye_offsets(glance_cur, &dl, &dr);
     const int dx[2] = { dl, dr };
     const int st = pose.stretch;
-    int h = eye_h0 * (1000 + st) / 1000;
-    int w = eye_w0 * 1000 / (1000 + st);
+    int h = eye_h0 * (1000 + st) / 1000 * shape_h_pm / 1000;
+    int w = eye_w0 * 1000 / (1000 + st) * shape_w_pm / 1000;
+    if (h < 2) h = 2;
+    if (w < 2) w = 2;
     h += h & 1; w += w & 1;
+    // Sleepy / grumpy: the lid comes down, the bottom of the eye stays put.
+    const int lid = shape_bottom ? (eye_h0 - h) / 2 : 0;
     for (int e = 0; e < 2; e++) {
-        const int cx = eye_cx[e] + dx[e];
-        const int cy = pose.y + eye_top + eye_h0 / 2 + pose.eye_dy;
+        const int cx = eye_cx[e] + dx[e] + look_dx[e];
+        const int cy = pose.y + eye_top + eye_h0 / 2 + pose.eye_dy + look_dy[e] + (squinting ? 0 : lid);
         EyeBox& b = eye_next[e];
         if (squinting) { b.x = cx - S(30); b.y = cy - eye_h0 / 2; b.w = box_w0; b.h = box_h0; b.ew = eye_w0; b.eh = eye_h0; b.solid = false; }
         else           { b.x = cx - w / 2; b.y = cy - h / 2;      b.w = w;      b.h = h;      b.ew = w;      b.eh = h;      b.solid = true; }
@@ -252,6 +262,7 @@ static void rest_hidden(void) {
     apply_pose();
     visible = false;
     field_hide(&field);
+    field.color = COL_FACE;   // a pet's neon tint ends with it (hidden: nothing to repaint)
 }
 
 static PerfWindow perf_window(void) {
@@ -311,9 +322,12 @@ static void start_motion(FaceMove m) {
 
 static void rise(int interest) {
     if (!root) return;
+    // Every face comes up in the shown account's colour (blue for #2).
+    if (!visible) field.color = g_account_tint ? NEON_ACCENT : COL_FACE;
     interest_g = interest;
     blink_phase = 0; glance_phase = 0;
     set_squint(false);
+    face_pet_reset();
     lv_anim_delete(&glance_cur, NULL);
     glance_cur = 0;
     start_motion(FACE_MOVE_RISE);
@@ -335,6 +349,7 @@ void face_drop(void) {
     // Eyes open and front-facing as it goes: he's looking at you, then away.
     blink_phase = 0;
     set_squint(false);
+    face_pet_reset();
     lv_anim_delete(&glance_cur, NULL);
     glance_phase = 0; glance_cur = 0;
     interest_g = 0;
@@ -349,6 +364,7 @@ void face_hide_now(void) {
     moving = false; resting = false;
     blink_phase = 0; glance_phase = 0; glance_cur = 0; interest_g = 0;
     set_squint(false);
+    face_pet_reset();
     rest_hidden();
 }
 
@@ -405,6 +421,48 @@ static void glance_to(int target) {
     lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
     lv_anim_set_completed_cb(&a, glance_done);
     lv_anim_start(&a);
+}
+
+// ─── Pet mode ────────────────────────────────────────────────────────────────
+void face_look_each(int dx0, int dy0, int dx1, int dy1) {
+    if (!root) return;
+    if (dx0 == look_dx[0] && dy0 == look_dy[0] && dx1 == look_dx[1] && dy1 == look_dy[1]) return;
+    look_dx[0] = dx0; look_dy[0] = dy0; look_dx[1] = dx1; look_dy[1] = dy1;
+    apply_eyes();
+}
+
+void face_set_eye_shape(int h_pm, int w_pm, bool from_bottom) {
+    if (!root) return;
+    if (h_pm == shape_h_pm && w_pm == shape_w_pm && from_bottom == shape_bottom) return;
+    shape_h_pm = h_pm; shape_w_pm = w_pm; shape_bottom = from_bottom;
+    apply_eyes();
+}
+
+void face_set_squint(bool on) {
+    if (!root || !visible) return;
+    blink_phase = 0;          // a held squint isn't a blink: nothing reopens it
+    set_squint(on);
+}
+
+void face_set_tint(bool neon) {
+    if (!root) return;
+    const lv_color_t c = neon ? NEON_ACCENT : COL_FACE;
+    if (lv_color_eq(field.color, c)) return;
+    field.color = c;
+    lv_obj_invalidate(root);  // one full repaint, only on a palette switch
+}
+
+void face_pet_reset(void) {
+    look_dx[0] = look_dx[1] = look_dy[0] = look_dy[1] = 0;
+    shape_h_pm = shape_w_pm = 1000;
+    shape_bottom = false;
+    if (root) apply_eyes();
+}
+
+void face_eye_center(int eye, int* x, int* y) {
+    const int e = eye ? 1 : 0;
+    *x = eye_cx[e] + look_dx[e];
+    *y = pose.y + eye_top + eye_h0 / 2 + pose.eye_dy + look_dy[e];
 }
 
 void face_tick(void) {

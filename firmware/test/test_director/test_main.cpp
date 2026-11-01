@@ -5,6 +5,9 @@
 #include <unity.h>
 #include "fake_world.h"
 #include "../../src/clawd_director.cpp"
+#include "../../src/accounts.h"
+
+extern int fake_hidden_acts;
 
 static const uint32_t TICK_MS = 10;
 
@@ -142,8 +145,8 @@ static void fuzz(uint32_t seed, uint32_t total_ms, bool has_big) {
         case 11:         (void)director_button(true); continue;
         case 12:         world.meters_live = fz_next() % 4 != 0; continue;
         case 13: {
-            static const char* const BEATS[] = { "show", "screensaver", "lurk", "peek", "joy", "home" };
-            director_debug(BEATS[fz_next() % 6]);
+            static const char* const BEATS[] = { "show", "screensaver", "lurk", "peek", "joy", "home", "pet" };
+            director_debug(BEATS[fz_next() % 7]);
             continue;
         }
         case 14:         director_set_liveliness((int)fz_range(1, 5)); continue;
@@ -258,6 +261,35 @@ static void attention_off(bool has_big) {
 // Without a touchscreen BOOT is the dismiss gesture: it ends an alert (and
 // tells the app) instead of doing its normal job; with nothing to dismiss, or
 // with a touchscreen, the press is left to its normal role.
+static void test_other_accounts_event_goes_to_its_own_clawd(void) {
+    world.has_big = true;
+    world.has_touch = true;
+    fresh_director();
+    run_for(2000);
+    accounts_reset();
+    UsageData d = live_payload();
+    d.account_count = 2;
+    d.account_idx = 2;          // the events below are account 2's
+    accounts_ingest(&d);
+    accounts_restore(1);        // ...while account 1 is on screen
+    fake_hidden_acts = 0;
+    SignalsUpdate sig = no_signal();
+    sig.event_fired = true;
+    sig.event = 'p';
+    sig.event_seq = 1;
+    send(d, sig);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, fake_hidden_acts, "account 2's Clawd reacts off screen");
+    TEST_ASSERT_FALSE_MESSAGE(mascot_acting(), "the one on screen stays put");
+    d.account_idx = 1;          // now an event of the account on screen
+    sig.event_seq = 2;
+    accounts_ingest(&d);
+    accounts_restore(1);
+    send(d, sig);
+    TEST_ASSERT_EQUAL_INT(1, fake_hidden_acts);
+    TEST_ASSERT_TRUE_MESSAGE(mascot_acting(), "the shown account's own event plays on screen");
+    accounts_reset();
+}
+
 static void test_boot_dismisses_alert_without_touch(void) {
     world.has_big = true;
     world.has_touch = false;
@@ -349,5 +381,6 @@ int main(int, char**) {
     RUN_TEST(test_short_attention_animation_with_full_size_sprite);
     RUN_TEST(test_short_attention_animation_without_full_size_sprite);
     RUN_TEST(test_fuzz_one_clawd_at_every_attention_animation);
+    RUN_TEST(test_other_accounts_event_goes_to_its_own_clawd);
     return UNITY_END();
 }

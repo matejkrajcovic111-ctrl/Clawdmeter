@@ -1,4 +1,5 @@
 #include "mascot.h"
+#include "account_tint.h"
 #include "clawd_anim.h"
 #include "clawd_policy.h"
 #include "splash_geometry.h"
@@ -58,6 +59,8 @@ static bool     attn_to_seat = true;   // attention over: the small one walks ho
 static uint32_t seated_since = 0;
 static uint32_t idle_gap = 7000;
 static const char* last_act = NULL;
+static const char* last_act_by[2] = { NULL, NULL };   // per account: what each Clawd did last
+static int      shown_acct = 0;                       // 0 = account 1, 1 = account 2
 static int      big_dx = 0;
 static uint8_t  big_act = 0;           // 0 waving, 1 pointing (attention, either size)
 static ClawdRng rng;
@@ -70,6 +73,14 @@ static const char* const ACTS_BY_RATE[4][4] = {
     { "waving",   "dancing", "lurking",  NULL      },   // active
     { "dancing",  "waving",  "dancing",  "lurking" },   // heavy: can't sit still
 };
+// clawdmeter2: account 2's Clawd has his own hobbies: the laptop, a ball,
+// a jump. He doesn't do account 1's lurk trip.
+static const char* const ACTS_BY_RATE_2[4][4] = {
+    { "laptop",        "jumping",    NULL,         NULL      },   // idle: tinkering
+    { "basketball",    "laptop",     "jumping",    NULL      },   // normal
+    { "soccer",        "basketball", "jumping",    "laptop"  },   // active
+    { "jumping happy", "soccer",     "basketball", "jumping" },   // heavy
+};
 static const uint16_t STILL_MS_BY_RATE[4] = { 10000, 7000, 5000, 3500 };
 static const uint16_t HURRY_PCT = 250;        // hurrying home from a lurk trip
 // An act taller than the headroom above his seat (jumping happy on a 240 px
@@ -79,6 +90,7 @@ static const char* const TALL_FALLBACK = "dancing";
 // Everything the corner buffer must fit.
 static const char* const CORNER_ANIMS[] = {
     "walking", "waving", "pointing", "dancing", "jumping happy",
+    "jumping", "laptop", "basketball", "soccer",   // account 2's acts
 };
 
 // ─── Rendering ───────────────────────────────────────────────────────────────
@@ -94,7 +106,7 @@ static void render(const ClawdAnim* a, uint16_t f, bool mirror, lv_image_dsc_t* 
     for (int gy = 0; gy < a->h; gy++) {
         for (int gx = 0; gx < a->w; gx++) {
             uint8_t code = src[gy * a->w + (mirror ? a->w - 1 - gx : gx)];
-            uint16_t col = (code && code < CLAWD_PALETTE_SIZE) ? a->palette[code] : 0;
+            uint16_t col = (code && code < CLAWD_PALETTE_SIZE) ? account_tint(a->palette[code]) : 0;
             uint8_t  al  = code ? 255 : 0;
             for (int dy = 0; dy < c; dy++) {
                 uint16_t* cp = &color[(gy * c + dy) * w + gx * c];
@@ -126,8 +138,19 @@ static int  left_edge(int y)  { int a, b; panel_row_span(screen_w, screen_h, rou
 static int  right_edge(int y) { int a, b; panel_row_span(screen_w, screen_h, round_panel, y, &a, &b); return b; }
 
 static void draw_corner(void) {
-    render(anim, frame, facing < 0, &dsc, buf, img, cell, x, feet_y);
+    // Acts cropped wider on the left of the art stage (a ball, a laptop) are
+    // shifted so his body stays where the idle pose has it (stage x 15).
+    const int dx = anim && facing >= 0 ? (anim->ox - 15) * cell : 0;
+    render(anim, frame, facing < 0, &dsc, buf, img, cell, x + dx, feet_y);
 }
+// The account colour changed: a seated Clawd is redrawn now (anyone moving is
+// redrawn on the next frame anyway).
+void mascot_retint(void) {
+    if (img && mode == M_SEATED) draw_corner();
+}
+static void draw_big(void);
+static void start_frames(const ClawdAnim* a);
+static void seat(void);
 static void draw_big(void) {
     render(anim, frame, mode == M_BIG_OUT, &big_dsc, big_buf, big_img,
            big_cell, big_x0 + anim->ox * big_cell + big_dx, big_feet_y);
@@ -158,6 +181,7 @@ static void seat(void) {
     // All-nonsense lets him land between acts.
     uint32_t still = (uint32_t)STILL_MS_BY_RATE[g] * clawd_tuning().idle_gap_pct / 100;
     if (still < 1500) still = 1500;
+    if (g_account_tint) still = still * 7 / 10;   // account 2 is the fidgety one
     idle_gap = clawd_jitter(still, &rng);
     show(img, true);
     draw_corner();
@@ -454,9 +478,10 @@ static void seated_tick(uint32_t now) {
     if (!autonomy || minimal || now - seated_since < idle_gap) return;
     int g = usage_rate_group();
     if (g < 0 || g > 3) g = 0;
-    const int pick = clawd_pick_no_repeat(ACTS_BY_RATE[g], 4, last_act, &rng);
+    const char* const* acts = g_account_tint ? ACTS_BY_RATE_2[g] : ACTS_BY_RATE[g];
+    const int pick = clawd_pick_no_repeat(acts, 4, last_act, &rng);
     if (pick < 0) { seated_since = now; return; }
-    const char* act = ACTS_BY_RATE[g][pick];
+    const char* act = acts[pick];
     last_act = act;
     if (strcmp(act, "lurking") == 0) {
         if (!big_img) { seated_since = now; return; }  // no full-size sprite: skip the trip
@@ -465,6 +490,10 @@ static void seated_tick(uint32_t now) {
     }
     const ClawdAnim* a = clawd_anim(act);
     if (!a) { seated_since = now; return; }
+    if (feet_y - a->h * cell < 0) {   // a jump that would hit the top edge
+        const ClawdAnim* f = clawd_anim(TALL_FALLBACK);
+        if (f) a = f;
+    }
     start_frames(a);
     speed = 100;
     act_left = 1;
@@ -473,9 +502,155 @@ static void seated_tick(uint32_t now) {
     draw_corner();
 }
 
+// ─── Two Clawds (clawdmeter2) ────────────────────────────────────────────────
+// Each account has its own Clawd with his own life: his own clock, dice and
+// favourite acts. The one on screen is the live sprite above; the other one
+// lives on here off screen (seat and corner acts only, nothing drawn). A
+// swipe trades them, so you meet whatever the other one is up to right now.
+struct Life {
+    const ClawdAnim* anim;   // NULL: sitting still
+    uint16_t frame;
+    uint32_t frame_started, seated_since, idle_gap;
+    const char* last_act;
+    ClawdRng rng;
+};
+static Life hidden_life;
+static bool hidden_ok = false;
+
+static uint32_t still_for(int acct, ClawdRng* r) {
+    int g = usage_rate_group();
+    if (g < 0 || g > 3) g = 0;
+    uint32_t still = (uint32_t)STILL_MS_BY_RATE[g] * clawd_tuning().idle_gap_pct / 100;
+    if (still < 1500) still = 1500;
+    if (acct) still = still * 7 / 10;
+    return clawd_jitter(still, r);
+}
+
+// Advance the off-screen Clawd to `now`, the way seated_tick and the act
+// frames would have played (a lurk trip there is just another rest).
+static void hidden_tick(uint32_t now) {
+    if (!hidden_ok || minimal || !autonomy) return;
+    Life& h = hidden_life;
+    const int acct = 1 - shown_acct;
+    for (int guard = 0; guard < 64; guard++) {
+        if (h.anim) {
+            const uint32_t hold = clawd_hold(h.anim, h.frame, 100);
+            if (now - h.frame_started < hold) return;
+            h.frame_started += hold;
+            if (++h.frame >= h.anim->frame_count) {   // act over: back to sitting
+                h.anim = NULL;
+                h.seated_since = h.frame_started;
+                h.idle_gap = still_for(acct, &h.rng);
+            }
+            continue;
+        }
+        if (now - h.seated_since < h.idle_gap) return;
+        int g = usage_rate_group();
+        if (g < 0 || g > 3) g = 0;
+        const char* const* acts = acct ? ACTS_BY_RATE_2[g] : ACTS_BY_RATE[g];
+        const int pick = clawd_pick_no_repeat(acts, 4, h.last_act, &h.rng);
+        const char* name = pick >= 0 ? acts[pick] : NULL;
+        const ClawdAnim* a = name && strcmp(name, "lurking") != 0 ? clawd_anim(name) : NULL;
+        if (a && feet_y - a->h * cell < 0) a = clawd_anim(TALL_FALLBACK);
+        if (name) h.last_act = name;
+        if (!a) {                                      // nothing to play: rest again
+            h.seated_since += h.idle_gap;
+            h.idle_gap = still_for(acct, &h.rng);
+            continue;
+        }
+        h.anim = a;
+        h.frame = 0;
+        h.frame_started = h.seated_since + h.idle_gap;
+    }
+    // Far behind (long sleep): just start a fresh rest from now.
+    h.anim = NULL; h.seated_since = now; h.idle_gap = still_for(acct, &h.rng);
+}
+
+static void hidden_start(uint32_t now) {
+    Life& h = hidden_life;
+    h.anim = NULL;
+    h.frame = 0;
+    h.last_act = NULL;
+    clawd_rng_seed(&h.rng, now ^ 0x5EED2u ^ (uint32_t)(shown_acct + 1) * 0x9E3779B9u);
+    // Out of step with the one on screen from the very start.
+    h.seated_since = now - clawd_rng_range(&h.rng, 0, 4000);
+    h.idle_gap = still_for(1 - shown_acct, &h.rng);
+    hidden_ok = true;
+}
+
+void mascot_hidden_act(const char* name) {
+    if (!img || minimal || !name) return;
+    const uint32_t now = millis();
+    if (!hidden_ok) hidden_start(now);
+    const ClawdAnim* a = clawd_anim(name);
+    if (!a || feet_y - a->h * cell < 0) a = clawd_anim(TALL_FALLBACK);
+    if (!a) return;
+    hidden_life.anim = a;
+    hidden_life.frame = 0;
+    hidden_life.frame_started = now;
+    hidden_life.last_act = name;
+}
+
+// Swiped to the other account (called while the portal covers the screen):
+// trade the two Clawds. The one leaving keeps living off screen.
+void mascot_account_changed(void) {
+    if (!img || !anim) return;
+    const int acct = g_account_tint ? 1 : 0;
+    if (acct == shown_acct) return;
+    const uint32_t now = millis();
+    if (!hidden_ok) hidden_start(now);
+    hidden_tick(now);
+    // An alert, minimal mode, or he's out (a trip, a show the director runs):
+    // no trade now. The other account's Clawd starts a fresh life off screen.
+    if (minimal || attn || (mode != M_SEATED && mode != M_ACT)) {
+        last_act_by[shown_acct] = last_act;
+        shown_acct = acct;
+        last_act = last_act_by[acct];
+        hidden_start(now);
+        return;
+    }
+
+    Life leaving;
+    leaving.anim = mode == M_ACT ? anim : NULL;
+    leaving.frame = mode == M_ACT ? frame : 0;
+    leaving.frame_started = frame_started;
+    leaving.seated_since = mode == M_ACT ? now : seated_since;
+    leaving.idle_gap = idle_gap;
+    leaving.last_act = last_act;
+    leaving.rng = rng;
+
+    const Life coming = hidden_life;
+    hidden_life = leaving;
+    shown_acct = acct;
+    last_act = coming.last_act;
+    rng = coming.rng;
+    facing = +1;
+    x = slot_x;
+    act_left = 1;
+    act_auto = true;
+    speed = 100;
+    if (coming.anim) {                     // mid-act: carry on from his frame
+        mode = M_ACT;
+        anim = coming.anim;
+        frame = coming.frame;
+        frame_started = coming.frame_started;
+        from_loop = false;
+    } else {                               // sitting: his next act of his own comes soon
+        seat();
+        seated_since = coming.seated_since;
+        idle_gap = coming.idle_gap;
+        const uint32_t soon = clawd_rng_range(&rng, 300, 900);
+        if (now - seated_since + soon < idle_gap) seated_since = now + soon - idle_gap;
+    }
+    show(img, true);
+    draw_corner();
+}
+
 void mascot_tick(void) {
     if (!img || !anim) return;
     const uint32_t now = millis();
+    if (!hidden_ok) hidden_start(now);
+    hidden_tick(now);                       // the other account's Clawd lives on too
     if (mode == M_SEATED) {
         if (attn && !big_img && !minimal) { seat_attention(); return; }   // back in his seat for the alert
         seated_tick(now);

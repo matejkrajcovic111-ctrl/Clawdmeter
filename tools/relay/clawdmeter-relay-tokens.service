@@ -1,0 +1,10 @@
+[Unit]
+Description=Send Claude Code token totals to Clawdmeter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# The relay reads its config from $HOME/.config/clawdmeter-relay/config.
+Environment=HOME=/root
+ExecStart=/usr/local/bin/clawdmeter-relay tokens

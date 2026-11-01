@@ -23,6 +23,13 @@ impl<K> Default for PlanSelector<K> {
 }
 
 impl<K: Clone + Eq + Hash + Ord> PlanSelector<K> {
+    /// `k` was just used (a prompt was sent in it): it becomes the active
+    /// account now, and stays so until another account moves.
+    pub fn touch(&mut self, k: &K) {
+        self.seq += 1;
+        self.last_active.insert(k.clone(), self.seq);
+    }
+
     /// Update from this cycle's `{account: session %}` and return the active
     /// account. `None` only when `sessions` is empty. Ties beyond recency and
     /// % fall to the smallest key so the result is deterministic.
@@ -51,6 +58,16 @@ mod tests {
 
     const A: &str = "/a";
     const B: &str = "/b";
+
+    #[test]
+    fn touch_makes_an_account_active_until_another_moves() {
+        let mut s = PlanSelector::default();
+        s.choose(&[(A, 10), (B, 30)]);
+        s.choose(&[(A, 20), (B, 30)]);
+        s.touch(&B);
+        assert_eq!(s.choose(&[(A, 20), (B, 30)]), Some(B));
+        assert_eq!(s.choose(&[(A, 25), (B, 30)]), Some(A));
+    }
 
     #[test]
     fn startup_picks_highest() {

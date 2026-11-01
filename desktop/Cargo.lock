@@ -1000,6 +1000,7 @@ dependencies = [
  "clawdmeter-ble",
  "clawdmeter-core",
  "clawdmeter-flash",
+ "clawdmeter-relay",
  "dbus",
  "dispatch2",
  "embed-resource",
@@ -1026,6 +1027,7 @@ dependencies = [
  "dbus",
  "futures",
  "log",
+ "serde_json",
  "tokio",
  "uuid",
 ]
@@ -1036,6 +1038,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "clawdmeter-relay",
  "dirs 6.0.0",
  "log",
  "serde",
@@ -1057,6 +1060,15 @@ dependencies = [
  "serialport",
  "sha2 0.10.9",
  "ureq",
+]
+
+[[package]]
+name = "clawdmeter-relay"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

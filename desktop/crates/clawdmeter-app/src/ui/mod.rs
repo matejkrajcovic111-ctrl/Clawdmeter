@@ -132,7 +132,7 @@ pub fn run(page: Option<Page>, paths: Paths, args: WindowArgs) -> i32 {
     let lock = match ipc::acquire_window_lock(&paths) {
         Ok(Some(f)) => Some(f),
         Ok(None) => {
-            log::info!("the Clawdmeter window is already open; bringing it to the front");
+            log::info!("the Clawdmeter2 window is already open; bringing it to the front");
             let _ = ipc::send_window_command(&paths, page.unwrap_or(Page::Overview));
             return 0;
         }
@@ -179,7 +179,7 @@ pub fn open_with_height(
         .detach();
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(SIZE.0), px(height)), cx))),
-            titlebar: Some(TitlebarOptions { title: Some("Clawdmeter".into()), ..Default::default() }),
+            titlebar: Some(TitlebarOptions { title: Some("Clawdmeter2".into()), ..Default::default() }),
             app_id: Some("clawdmeter".into()),
             is_resizable: true,
             window_min_size: Some(size(px(MIN_SIZE.0), px(MIN_SIZE.1))),
@@ -286,7 +286,7 @@ pub fn chrome(t: &Theme, window: &Window, body: impl IntoElement) -> impl IntoEl
                             .justify_center()
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_size(px(14.))
-                            .child("Clawdmeter"),
+                            .child("Clawdmeter2"),
                     )
                     .child(
                         div()
@@ -350,7 +350,7 @@ pub fn live_status(paths: &Paths) -> Option<StatusSnapshot> {
 /// running; the pages say so where it matters).
 pub fn command(paths: &Paths, cmd: AppCommand) {
     if live_status(paths).is_none() {
-        log::info!("{}: Clawdmeter isn't running", cmd.encode());
+        log::info!("{}: Clawdmeter2 isn't running", cmd.encode());
         return;
     }
     if let Err(e) = ipc::send_command(paths, &cmd) {
@@ -360,7 +360,7 @@ pub fn command(paths: &Paths, cmd: AppCommand) {
 
 /// Text for "the daemon isn't running" banners.
 pub fn not_running_text() -> SharedString {
-    "Start Clawdmeter from your app menu, or run clawdmeter in a terminal.".into()
+    "Start Clawdmeter2 from your app menu, or run clawdmeter in a terminal.".into()
 }
 
 /// Run blocking work off the UI thread, then hand the result to the view.

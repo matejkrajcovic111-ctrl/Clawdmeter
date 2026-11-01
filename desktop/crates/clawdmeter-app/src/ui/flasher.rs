@@ -364,6 +364,15 @@ impl FlasherView {
         let repo = Settings::load(&self.paths)
             .map(|s| s.release_repo)
             .unwrap_or_else(|_| clawdmeter_flash::DEFAULT_RELEASE_REPO.into());
+        if clawdmeter_core::config::uses_upstream_releases(&repo) {
+            // Clawdmeter2 has no online releases; never download upstream firmware.
+            self.source =
+                Some(Err(("Clawdmeter2 has no online firmware. Open a local release folder instead.".into(), true)));
+            if self.step == Step::Identify && self.candidates.is_empty() && !self.probing {
+                self.identify(cx);
+            }
+            return;
+        }
         run_blocking(
             cx,
             move || {

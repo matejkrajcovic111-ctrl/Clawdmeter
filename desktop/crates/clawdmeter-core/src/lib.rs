@@ -23,11 +23,15 @@
 pub mod attention;
 pub mod autostart;
 pub mod backoff;
+pub mod burn;
 pub mod cadence;
 pub mod config;
 pub mod engine;
 pub mod events;
+pub mod history;
+pub mod identity;
 pub mod launch;
+pub mod live;
 pub mod oauth;
 pub mod paths;
 pub mod payload;
@@ -35,7 +39,14 @@ pub mod platform;
 pub mod probe;
 pub mod rate;
 pub mod selector;
+pub mod toolinfo;
+pub mod turn;
 pub mod usage;
+pub mod working;
+
+/// Claude Code token totals per day from the session transcripts (shared
+/// with the relay, which sends a server's totals).
+pub use clawdmeter_relay::tokens;
 
 pub use config::{ConfigFile, Settings};
 pub use engine::{AccountError, Engine, EngineStatus, HostClock, PollPlan, Write, WriteKind};
@@ -44,7 +55,7 @@ pub use payload::Payload;
 pub use usage::{UsageError, UsageReading, Window};
 
 /// The device's advertised name.
-pub const DEVICE_NAME: &str = "Clawdmeter";
+pub const DEVICE_NAME: &str = "Clawdmeter2";
 
 /// Unix seconds now.
 pub fn unix_now() -> i64 {

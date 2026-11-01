@@ -12,9 +12,13 @@ use std::time::Duration;
 
 use clawdmeter_core::autostart::{self, LaunchMode};
 use clawdmeter_core::config::{AlertOn, AttentionAnim, ClockMode, ConfigFile, LIVELINESS_MAX};
+use clawdmeter_core::identity::AccountBook;
 use clawdmeter_core::{Paths, Settings};
 use clawdmeter_flash::device::{self, FirmwareInfo};
-use gpui::{div, img, prelude::*, px, Context, EventEmitter, PathPromptOptions, SharedString, Window};
+use gpui::{
+    div, img, prelude::*, px, Context, EventEmitter, FocusHandle, KeyDownEvent, MouseButton, PathPromptOptions,
+    SharedString, Window,
+};
 
 use super::theme::{Theme, FONT_DISPLAY, FONT_MONO, R_M, R_S};
 use super::widgets::{
@@ -78,6 +82,8 @@ pub struct SettingsView {
     settings: Settings,
     config_error: Option<String>,
     hooks: Vec<HookRow>,
+    /// Who is logged in where, as the daemon last saved it.
+    book: AccountBook,
     preview: Option<HookPreview>,
     hook_msg: Option<(Tone, String)>,
     /// The last test alert's outcome, shown on and beside its button for a
@@ -104,6 +110,58 @@ pub struct SettingsView {
     /// The Settings page's Advanced section is open.
     advanced: bool,
     ticks: u32,
+    /// The "Accept events from other machines" box is ticked (it can be
+    /// ticked before an address is typed; unticking removes `relay_listen`).
+    relay_open: bool,
+    /// `relay_listen` / `relay_key` as written in the config (the key
+    /// unfiltered, so a short one being typed still shows).
+    relay_listen_raw: String,
+    relay_key_raw: String,
+    /// Keyboard focus of the listen address and key fields.
+    relay_focus: [FocusHandle; 2],
+}
+
+/// The relay's two text fields.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RelayField {
+    Listen,
+    Key,
+}
+
+impl RelayField {
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn config_key(self) -> &'static str {
+        match self {
+            RelayField::Listen => "relay_listen",
+            RelayField::Key => "relay_key",
+        }
+    }
+}
+
+/// Shortest `relay_key` the app accepts.
+const RELAY_KEY_MIN: usize = 16;
+
+/// A fresh 32-character alphanumeric key. Randomness comes from std's
+/// `RandomState`, which the OS seeds for every instance.
+fn generate_relay_key() -> String {
+    use std::hash::{BuildHasher, Hasher, RandomState};
+    const ALPHABET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut out = String::with_capacity(32);
+    while out.len() < 32 {
+        let mut h = RandomState::new().build_hasher();
+        h.write_usize(out.len());
+        let mut n = h.finish();
+        for _ in 0..8 {
+            if out.len() < 32 {
+                out.push(ALPHABET[(n % ALPHABET.len() as u64) as usize] as char);
+            }
+            n /= ALPHABET.len() as u64;
+        }
+    }
+    out
 }
 
 impl EventEmitter<Navigate> for SettingsView {}
@@ -133,6 +191,7 @@ impl SettingsView {
             snap: None,
             config_error: None,
             hooks: Vec::new(),
+            book: AccountBook::new(Vec::new()),
             preview: None,
             hook_msg: None,
             test_alert: None,
@@ -147,6 +206,10 @@ impl SettingsView {
             notice: None,
             advanced: false,
             ticks: 0,
+            relay_open: false,
+            relay_listen_raw: String::new(),
+            relay_key_raw: String::new(),
+            relay_focus: [cx.focus_handle(), cx.focus_handle()],
         };
         v.reload();
         v.show(page, false, cx);
@@ -216,6 +279,10 @@ impl SettingsView {
                 ))
             }
         }
+        let raw = ConfigFile::load(&self.paths.config_file).unwrap_or_default();
+        let get = |k: &str| raw.get(k).map(str::trim).unwrap_or_default().to_owned();
+        self.relay_listen_raw = get("relay_listen");
+        self.relay_key_raw = get("relay_key");
         self.hooks = self
             .settings
             .config_dirs
@@ -224,10 +291,12 @@ impl SettingsView {
                 dir: d.clone(),
                 status: match &self.hook_exe {
                     Some(exe) => hooks::dir_status(d, exe),
-                    None => HookStatus::Unreadable("Couldn't locate the Clawdmeter executable.".into()),
+                    None => HookStatus::Unreadable("Couldn't locate the Clawdmeter2 executable.".into()),
                 },
             })
             .collect();
+        self.book = AccountBook::load(&self.paths.state_dir.join("accounts.json"))
+            .unwrap_or_else(|_| AccountBook::new(self.settings.accounts.clone()));
         self.autostart_on = autostart::is_enabled(&self.paths.home, LaunchMode::Tray);
         self.autostart_stale = self
             .launch_exe
@@ -319,6 +388,54 @@ impl SettingsView {
         );
     }
 
+    /// The folder for table account `i`, created and watched when new.
+    fn folder_for_row(&mut self, i: usize) -> Option<PathBuf> {
+        let email = self.settings.accounts.get(i)?.clone();
+        let (dir, create) =
+            crate::accounts::folder_for(&email, &self.book, &self.settings.config_dirs, &self.paths.home);
+        if create {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                self.notice = Some((Tone::Bad, format!("Couldn't create {}: {e}", dir.display())));
+                return None;
+            }
+            let d = dir.clone();
+            self.save(|s, _| s.config_dirs.push(d));
+            if self.notice.is_some() {
+                // save failed: keep its error notice, don't act on an unwatched folder
+                return None;
+            }
+        }
+        Some(dir)
+    }
+
+    /// Open a console that logs table account `i` in.
+    fn login(&mut self, i: usize) {
+        let Some(claude) = clawdmeter_core::usage::find_claude(self.settings.claude_path.as_deref(), &self.paths.home)
+        else {
+            self.notice = Some((Tone::Bad, "Claude Code not found. Set claude_path in the config file.".into()));
+            return;
+        };
+        let Some(dir) = self.folder_for_row(i) else { return };
+        self.notice = crate::accounts::open_login(&claude, &dir, &self.paths.home, i + 1).err().map(|e| (Tone::Bad, e));
+    }
+
+    /// Open a PowerShell console running Claude Code for table account `i`.
+    fn open_claude(&mut self, i: usize) {
+        let Some(claude) = clawdmeter_core::usage::find_claude(self.settings.claude_path.as_deref(), &self.paths.home)
+        else {
+            self.notice = Some((Tone::Bad, "Claude Code not found. Set claude_path in the config file.".into()));
+            return;
+        };
+        let Some(dir) = self.folder_for_row(i) else { return };
+        self.notice =
+            crate::accounts::open_claude(&claude, &dir, &self.paths.home, i + 1).err().map(|e| (Tone::Bad, e));
+    }
+
+    /// Drop an email from the account table; the daemon's book follows.
+    fn forget(&mut self, email: String) {
+        self.save(|s, _| s.accounts.retain(|e| *e != email));
+    }
+
     fn add_account(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -344,16 +461,190 @@ impl SettingsView {
     /// The binary to set the hooks (`hooks`) or the login entry up with,
     /// or why not.
     fn launchable(&self, hooks: bool) -> Result<PathBuf, String> {
-        let missing = || "Couldn't locate the Clawdmeter executable.".to_owned();
+        let missing = || "Couldn't locate the Clawdmeter2 executable.".to_owned();
         let exe = self.launch_exe.clone().ok_or_else(missing)?;
         if let Some(u) = clawdmeter_core::launch::unstable(&exe) {
-            return Err(format!("Clawdmeter is running from {}. {}", u.location_noun(), u.advice()));
+            return Err(format!("Clawdmeter2 is running from {}. {}", u.location_noun(), u.advice()));
         }
         if hooks {
             self.hook_exe.clone().ok_or_else(missing)
         } else {
             Ok(exe)
         }
+    }
+
+    /// The status line command saved by an earlier install
+    /// (`statusline_command`).
+    fn saved_statusline(&self) -> Option<String> {
+        let cfg = ConfigFile::load(&self.paths.config_file).ok()?;
+        cfg.get("statusline_command").map(str::trim).filter(|c| !c.is_empty()).map(str::to_owned)
+    }
+
+    /// Save the user's own status line as `statusline_command`, unless one is
+    /// already saved, so `clawdmeter statusline` keeps showing it.
+    fn keep_statusline(&self, cmd: &str) -> Result<(), String> {
+        if cmd.contains(['\n', '\r', '#']) {
+            return Err(format!(
+                "Your current status line ({cmd}) can't be stored in the config file. Set statusline_command there \
+                 by hand, then try again."
+            ));
+        }
+        write_settings(&self.paths, |_, cfg| {
+            if cfg.get("statusline_command").is_none_or(|c| c.trim().is_empty()) {
+                cfg.set("statusline_command", cmd);
+            }
+        })
+        .map_err(|e| errors::save_failed("settings", &self.paths.config_file, &self.paths.home, &e))
+    }
+
+    /// Change one relay key in the config (blank removes it).
+    fn set_relay(&mut self, which: RelayField, value: &str) {
+        let (key, value) = (which.config_key(), value.trim().to_owned());
+        self.save(|_, cfg| if value.is_empty() { cfg.remove(key) } else { cfg.set(key, &value) });
+    }
+
+    /// The "Accept events from other machines" box.
+    fn toggle_relay(&mut self) {
+        if self.relay_open || !self.relay_listen_raw.is_empty() {
+            self.relay_open = false;
+            self.set_relay(RelayField::Listen, "");
+        } else {
+            self.relay_open = true;
+        }
+    }
+
+    fn generate_key(&mut self) {
+        self.set_relay(RelayField::Key, &generate_relay_key());
+    }
+
+    fn relay_key_down(&mut self, which: RelayField, e: &KeyDownEvent, cx: &mut Context<Self>) {
+        let ks = &e.keystroke;
+        let mut text = match which {
+            RelayField::Listen => self.relay_listen_raw.clone(),
+            RelayField::Key => self.relay_key_raw.clone(),
+        };
+        let shortcut = ks.modifiers.control || ks.modifiers.platform;
+        if shortcut && ks.key == "v" {
+            let pasted = cx.read_from_clipboard().and_then(|c| c.text()).unwrap_or_default();
+            text.extend(pasted.lines().next().unwrap_or("").trim().chars().filter(|c| !c.is_control()));
+        } else if shortcut || ks.modifiers.alt {
+            return;
+        } else if ks.key == "backspace" {
+            text.pop();
+        } else if let Some(ch) = ks.key_char.as_deref().filter(|c| !c.chars().any(char::is_control)) {
+            text.push_str(ch);
+        } else {
+            return;
+        }
+        self.set_relay(which, &text);
+        cx.notify();
+    }
+
+    /// A one-line text box that edits a relay key in the config as you type.
+    fn relay_input(
+        &self,
+        t: &Theme,
+        id: &'static str,
+        which: RelayField,
+        placeholder: &'static str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let focus = self.relay_focus[which.index()].clone();
+        let focused = focus.is_focused(window);
+        let text = match which {
+            RelayField::Listen => &self.relay_listen_raw,
+            RelayField::Key => &self.relay_key_raw,
+        };
+        let click_focus = focus.clone();
+        div()
+            .id(id)
+            .debug_selector(move || id.to_owned())
+            .track_focus(&focus)
+            .on_key_down(cx.listener(move |v, e: &KeyDownEvent, _, cx| v.relay_key_down(which, e, cx)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |_, _, w, cx| {
+                    w.focus(&click_focus);
+                    cx.notify();
+                }),
+            )
+            .flex()
+            .items_center()
+            .w(px(300.))
+            .h(px(32.))
+            .px(px(10.))
+            .rounded(px(R_S))
+            .bg(t.surface)
+            .border_1()
+            .border_color(if focused { t.accent } else { t.line })
+            .font_family(FONT_MONO)
+            .text_size(px(13.))
+            .overflow_hidden()
+            .child(if text.is_empty() {
+                div().text_color(t.mute).child(placeholder)
+            } else {
+                div().text_color(t.text).child(SharedString::from(text.clone()))
+            })
+    }
+
+    /// The Settings page's relay section.
+    fn relay_section(&mut self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
+        let on = self.relay_open || !self.relay_listen_raw.is_empty();
+        let me = cx.entity().downgrade();
+        let mut sec =
+            div().flex().flex_col().pt(px(10.)).child(subheading(t, "Relay (other machines)")).child(checkbox(
+                t,
+                "relay-on",
+                "Accept events from other machines",
+                "Lets Claude Code on a server or another PC show up here. See docs/relay-setup.md.",
+                on,
+                move |_, _, cx| {
+                    let _ = me.update(cx, |v, cx| {
+                        v.toggle_relay();
+                        cx.notify();
+                    });
+                },
+            ));
+        if on {
+            let me = cx.entity().downgrade();
+            let short = !self.relay_key_raw.is_empty() && self.relay_key_raw.len() < RELAY_KEY_MIN;
+            sec = sec
+                .child(field_stacked(
+                    t,
+                    "Listen address",
+                    "This PC's Tailscale IP and a port. Changing it applies after you restart Clawdmeter2.",
+                    self.relay_input(
+                        t,
+                        "relay-listen",
+                        RelayField::Listen,
+                        "<this PC's Tailscale IP>:8790",
+                        window,
+                        cx,
+                    ),
+                ))
+                .child(field_stacked(
+                    t,
+                    "Key",
+                    if short {
+                        "Too short: a key needs at least 16 characters. Use the same key on the other machine."
+                    } else {
+                        "A shared secret of at least 16 characters. Use the same key on the other machine."
+                    },
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(self.relay_input(t, "relay-key", RelayField::Key, "Type or generate a key", window, cx))
+                        .child(button(t, "relay-generate", "Generate", ButtonKind::Small, true, move |_, _, cx| {
+                            let _ = me.update(cx, |v, cx| {
+                                v.generate_key();
+                                cx.notify();
+                            });
+                        })),
+                ));
+        }
+        sec
     }
 
     fn plan_hooks(&mut self, action: HookAction, dirs: Vec<PathBuf>) {
@@ -370,14 +661,23 @@ impl SettingsView {
                 None => return,
             },
         };
+        let restore = self.saved_statusline();
+        // Only one foreign status line can be passed through: the saved one,
+        // else the first account's. A different one elsewhere stays as it is.
+        let mut kept = restore.clone();
         let mut plans = Vec::new();
         for d in dirs {
             let plan = match action {
-                HookAction::Install => hooks::plan_install(&d, &exe),
-                HookAction::Remove => hooks::plan_uninstall(&d),
+                HookAction::Install => hooks::plan_install_keeping(&d, &exe, kept.as_deref()),
+                HookAction::Remove => hooks::plan_uninstall(&d, restore.as_deref()),
             };
             match plan {
-                Ok(p) if p.changes() => plans.push(p),
+                Ok(p) if p.changes() => {
+                    if kept.is_none() {
+                        kept.clone_from(&p.kept_statusline);
+                    }
+                    plans.push(p);
+                }
                 Ok(_) => {}
                 Err(e) => {
                     let f = tilde(&d.join("settings.json").display().to_string(), &self.paths.home);
@@ -397,6 +697,14 @@ impl SettingsView {
         let Some(p) = self.preview.take() else { return };
         let mut done = 0;
         for plan in &p.plans {
+            // Their own status line goes into the config before it is replaced.
+            if let Some(cmd) = &plan.kept_statusline {
+                if let Err(why) = self.keep_statusline(cmd) {
+                    self.hook_msg = Some((Tone::Bad, why));
+                    self.reload();
+                    return;
+                }
+            }
             if let Err(e) = plan.apply() {
                 // Files are written one by one: say which ones made it.
                 let what = tilde(&plan.path.display().to_string(), &self.paths.home);
@@ -411,12 +719,20 @@ impl SettingsView {
             }
             done += 1;
         }
+        let skipped = p.plans.iter().filter(|pl| pl.skipped_statusline.is_some()).count();
         let accounts = if done == 1 { "1 account".to_string() } else { format!("{done} accounts") };
         self.hook_msg = Some((
             Tone::Ok,
             match p.action {
                 HookAction::Install => {
-                    format!("Hooks installed in {accounts}. Your original settings are kept in settings.json.bak.")
+                    let note = if skipped == 0 {
+                        String::new()
+                    } else {
+                        " Another account has a different status line of its own; it was left as it is.".to_owned()
+                    };
+                    format!(
+                        "Hooks installed in {accounts}. Your original settings are kept in settings.json.bak.{note}"
+                    )
                 }
                 HookAction::Remove => {
                     format!("Hooks removed from {accounts}. Your original settings are kept in settings.json.bak.")
@@ -432,7 +748,7 @@ impl SettingsView {
         let written =
             std::fs::create_dir_all(&self.paths.state_dir).and_then(|_| std::fs::write(&path, body.to_string()));
         self.test_alert = Some(match written {
-            Ok(()) if self.snap.is_none() => Err("Clawdmeter isn't running.".into()),
+            Ok(()) if self.snap.is_none() => Err("Clawdmeter2 isn't running.".into()),
             Ok(()) => Ok(()),
             Err(e) => Err(format!("Couldn't send it. {}", errors::io_message(&e))),
         });
@@ -480,7 +796,7 @@ impl SettingsView {
         };
         let update = snap.as_ref().and_then(|s| s.update_available().map(str::to_owned));
         let (link_tone, link): (Tone, SharedString) = match snap.as_ref() {
-            None => (Tone::Plain, "Clawdmeter isn't running".into()),
+            None => (Tone::Plain, "Clawdmeter2 isn't running".into()),
             Some(s) => match s.link.as_str() {
                 "connected" => (Tone::Ok, "Bluetooth connected".into()),
                 "no_adapter" => (Tone::Bad, "Bluetooth unavailable".into()),
@@ -717,8 +1033,9 @@ impl SettingsView {
             )))
             .child(para(
                 t,
-                "The default Claude Code folder is ~/.claude. Add a config folder for each other account you want \
-                 to monitor. The device follows the account whose session usage increased most recently.",
+                "Each account is shown by its email; a logged-out account stays listed with its last reading. Add a \
+                 config folder if you log in somewhere other than ~/.claude. The device follows the account whose \
+                 session usage increased most recently.",
             ))
             .when_some(self.snap.as_ref(), |d, snap| {
                 d.child(caption(
@@ -731,24 +1048,31 @@ impl SettingsView {
                     },
                 ))
             });
-        let active = self.snap.as_ref().and_then(|s| s.account.clone());
-        let errors: Vec<ipc::AccountError> = self.snap.as_ref().map(|s| s.errors.clone()).unwrap_or_default();
-        let only_one = self.settings.config_dirs.len() <= 1;
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         let mut list = div().flex().flex_col().rounded(px(R_M)).border_1().border_color(t.line);
-        for (i, d) in self.settings.config_dirs.clone().into_iter().enumerate() {
-            let ds = d.display().to_string();
-            let err = errors.iter().find(|e| e.dir == ds).cloned();
-            let is_active = active.as_deref() == Some(ds.as_str());
-            let (meta, chip) = match (&err, is_active) {
-                // Transient errors retry on their own; the rest need the user.
-                (Some(e), _) if e.retrying => (e.message.clone(), Some(pill(t, "Retrying", Tone::Warn))),
-                (Some(e), _) => (e.message.clone(), Some(pill(t, "Needs attention", Tone::Bad))),
-                (None, true) => (String::new(), Some(pill(t, "On device", Tone::Ok))),
-                (None, false) if self.snap.is_some() => ("Not selected for the device".to_string(), None),
-                (None, false) => ("Start Clawdmeter to check usage.".to_string(), None),
+        for (i, email) in self.settings.accounts.clone().into_iter().enumerate() {
+            let dirs = self.book.dirs_of(&email);
+            let where_ = if dirs.is_empty() {
+                "logged out".to_owned()
+            } else {
+                dirs.iter().map(|d| tilde(&d.display().to_string(), &self.paths.home)).collect::<Vec<_>>().join(", ")
+            };
+            let seen = self
+                .book
+                .saved(&email)
+                .map(|r| format!("last seen {}", crate::ago(now - r.read_at)))
+                .unwrap_or_else(|| "not seen yet".to_owned());
+            // The board's colours for #1 and #2 (firmware/src/theme.h).
+            let dot = match i {
+                0 => gpui::rgb(0xd97757),
+                1 => gpui::rgb(0x4aa3ff),
+                _ => t.mute,
             };
             let me = cx.entity().downgrade();
-            let dir = d.clone();
+            let me_login = me.clone();
+            let me_open = me.clone();
+            let forget_email = email.clone();
             list = list.child(
                 div()
                     .flex()
@@ -757,6 +1081,8 @@ impl SettingsView {
                     .px(px(14.))
                     .py(px(12.))
                     .when(i > 0, |r| r.border_t_1().border_color(t.line))
+                    .child(div().font_family(FONT_MONO).text_size(px(13.)).child(format!("#{}", i + 1)))
+                    .child(div().w(px(10.)).h(px(10.)).rounded_full().bg(dot))
                     .child(
                         div()
                             .flex()
@@ -764,36 +1090,56 @@ impl SettingsView {
                             .flex_1()
                             .min_w_0()
                             .gap(px(2.))
-                            .child(div().font_family(FONT_MONO).text_size(px(13.)).child(tilde(&ds, &self.paths.home)))
-                            .when(!meta.is_empty(), |d| {
-                                d.child(div().text_size(px(12.5)).text_color(t.mute).child(meta))
-                            }),
+                            .child(div().text_size(px(13.)).child(email))
+                            .child(div().text_size(px(12.5)).text_color(t.mute).child(format!("{where_} · {seen}"))),
                     )
-                    .when_some(chip, |r, c| r.child(c))
                     .child(button(
                         t,
-                        SharedString::from(format!("rm-{i}")),
-                        "Remove",
+                        SharedString::from(format!("open-claude-{i}")),
+                        "Open Claude",
                         ButtonKind::Small,
-                        !only_one,
+                        true,
                         move |_, _, cx| {
-                            let dir = dir.clone();
+                            let _ = me_open.update(cx, |v, cx| {
+                                v.open_claude(i);
+                                cx.notify();
+                            });
+                        },
+                    ))
+                    .child(button(
+                        t,
+                        SharedString::from(format!("login-{i}")),
+                        "Log in",
+                        ButtonKind::Small,
+                        true,
+                        move |_, _, cx| {
+                            let _ = me_login.update(cx, |v, cx| {
+                                v.login(i);
+                                cx.notify();
+                            });
+                        },
+                    ))
+                    .child(button(
+                        t,
+                        SharedString::from(format!("forget-{i}")),
+                        "Forget",
+                        ButtonKind::Small,
+                        true,
+                        move |_, _, cx| {
+                            let e = forget_email.clone();
                             let _ = me.update(cx, |v, cx| {
-                                v.save(|s, _| s.config_dirs.retain(|x| *x != dir));
+                                v.forget(e);
                                 cx.notify();
                             });
                         },
                     )),
             );
         }
-        pane = pane.child(list).child(caption(
+        pane = pane.child(list);
+        pane = pane.child(caption(
             t,
-            if only_one {
-                "Removing a folder stops monitoring it; its files and installed hooks stay in place. The last \
-                 folder can't be removed."
-            } else {
-                "Removing a folder stops monitoring it; its files and installed hooks stay in place."
-            },
+            "Accounts are tracked by the email you log in with, in any watched folder. Forget drops an account \
+             from the list; logging it in again adds it back.",
         ));
         if self.snap.is_none() {
             pane = pane.child(notice(t, Tone::Plain, not_running_text()));
@@ -806,7 +1152,8 @@ impl SettingsView {
             d.child(heading(t, "Hooks")).child(para(
                 t,
                 "Hooks let Clawd react to activity and show alerts. The event log stores timestamps, event types, \
-                 and session IDs. Alerts also store notification or question text for the device. Usage meters work \
+                 and session IDs. Alerts also store notification or question text for the device. Installing also \
+                 sets Claude Code's status line to Clawdmeter2's (one you had keeps showing). Usage meters work \
                  without hooks.",
             ))
         });
@@ -818,17 +1165,17 @@ impl SettingsView {
         for (i, row) in self.hooks.iter().enumerate() {
             let (meta, chip, action): (String, (&str, Tone), Option<(&str, HookAction)>) = match &row.status {
                 HookStatus::Installed => (
-                    format!("{} hooks installed", HOOKS.len()),
+                    format!("{} hooks and the status line installed", HOOKS.len()),
                     ("Installed", Tone::Ok),
                     Some(("Review removal", HookAction::Remove)),
                 ),
                 HookStatus::Missing => (
-                    "Clawdmeter hooks are not installed. Other hooks are kept.".into(),
+                    "Clawdmeter2 hooks are not installed. Other hooks are kept.".into(),
                     ("Not installed", Tone::Plain),
                     Some(("Review install", HookAction::Install)),
                 ),
                 HookStatus::Legacy => (
-                    "Uses attention-hook.sh. Update to the built-in Clawdmeter hooks.".into(),
+                    "Uses attention-hook.sh. Update to the built-in Clawdmeter2 hooks.".into(),
                     ("Legacy hooks", Tone::Warn),
                     Some(("Review update", HookAction::Install)),
                 ),
@@ -836,7 +1183,7 @@ impl SettingsView {
                     if let Some(u) = clawdmeter_core::launch::unstable(Path::new(old)) {
                         format!("Runs {}, {}.", tilde(old, &self.paths.home), u.location())
                     } else if Path::new(old).exists() {
-                        format!("Uses another Clawdmeter executable: {}.", tilde(old, &self.paths.home))
+                        format!("Uses another Clawdmeter2 executable: {}.", tilde(old, &self.paths.home))
                     } else {
                         format!("Runs {}, which no longer exists.", tilde(old, &self.paths.home))
                     },
@@ -1059,14 +1406,14 @@ impl SettingsView {
         )
     }
 
-    fn settings_pane(&mut self, t: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+    fn settings_pane(&mut self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
         let me = cx.entity().downgrade();
         let on = self.autostart_on;
         let home = self.paths.home.clone();
         let mut pane = div().flex().flex_col().gap(px(6.)).child(heading(t, "Settings")).child(field(
             t,
             "Start at login",
-            "Opens Clawdmeter when you sign in.",
+            "Opens Clawdmeter2 when you sign in.",
             toggle(t, "autostart", on, true, move |_, _, cx| {
                 let home = home.clone();
                 let _ = me.update(cx, |v, cx| {
@@ -1095,7 +1442,7 @@ impl SettingsView {
                     tilde(&o.display().to_string(), &self.paths.home)
                 ),
                 Some(o) => format!(
-                    "Start at login opens another copy of Clawdmeter: {}.",
+                    "Start at login opens another copy of Clawdmeter2: {}.",
                     tilde(&o.display().to_string(), &self.paths.home)
                 ),
                 None => "Start at login can't be read.".into(),
@@ -1164,6 +1511,7 @@ impl SettingsView {
                 });
             }),
         ));
+        pane = pane.child(self.relay_section(t, window, cx));
         // A missing CLI stops everything, so it isn't tucked under Advanced.
         if self.snap.as_ref().is_some_and(|s| s.claude.is_none()) {
             let cfgp = self.paths.config_file.clone();
@@ -1190,8 +1538,8 @@ impl SettingsView {
         let p = self.paths.clone();
         pane = pane.child(field(
             t,
-            "Quit Clawdmeter",
-            "Stops usage updates and closes Clawdmeter. The device retains its last reading.",
+            "Quit Clawdmeter2",
+            "Stops usage updates and closes Clawdmeter2. The device retains its last reading.",
             button(t, "quit", "Quit", ButtonKind::Small, self.snap.is_some(), move |_, window, _| {
                 command(&p, AppCommand::Quit);
                 window.remove_window();
@@ -1204,7 +1552,7 @@ impl SettingsView {
                 t,
                 "Legacy service detected",
                 format!(
-                    "Disable {} so only one Clawdmeter process connects to the device.",
+                    "Disable {} so only one Clawdmeter2 process connects to the device.",
                     tilde(&legacy.describe(), &self.paths.home)
                 ),
                 button(t, "legacy", "Disable legacy service", ButtonKind::Primary, true, move |_, _, cx| {
@@ -1261,7 +1609,7 @@ impl SettingsView {
                 match &claude {
                     Some(c) => format!("Usage is read with {}.", crate::claude_label(Path::new(c), &self.paths.home)),
                     None if self.snap.is_some() => "Not found.".into(),
-                    None => "Start Clawdmeter to detect Claude Code.".into(),
+                    None => "Start Clawdmeter2 to detect Claude Code.".into(),
                 },
                 div(),
             ));
@@ -1296,7 +1644,7 @@ impl SettingsView {
 
 /// What a new config file starts with: the keys people reach for, commented.
 const CONFIG_TEMPLATE: &str = "\
-# Clawdmeter settings: key = value. The app re-reads this file within a few seconds.
+# Clawdmeter2 settings: key = value. The app re-reads this file within a few seconds.
 # claude_path = /path/to/claude
 # config_dirs = ~/.claude, ~/.claude-work
 # heartbeat_interval = 60
@@ -1327,7 +1675,7 @@ impl Render for SettingsView {
         let mut pane = match self.page {
             Page::Accounts => self.accounts_pane(&t, cx),
             Page::Hooks => self.hooks_pane(&t, cx),
-            Page::Settings => self.settings_pane(&t, cx),
+            Page::Settings => self.settings_pane(&t, window, cx),
             _ => self.device_pane(&t, cx),
         };
         if let Some(e) = self.config_error.clone().or_else(|| self.notice.as_ref().map(|(_, m)| m.clone())) {
@@ -1482,12 +1830,38 @@ mod tests {
         assert!(paths.attention_file().exists());
         // No app-status.json: the app isn't running to pick it up.
         view.read_with(cx, |v, _| {
-            assert_eq!(v.test_alert, Some(Err("Clawdmeter isn't running.".into())));
+            assert_eq!(v.test_alert, Some(Err("Clawdmeter2 isn't running.".into())));
             assert!(v.hook_msg.is_none(), "no banner");
         });
         cx.executor().advance_clock(TEST_ALERT_FAILED);
         cx.run_until_parked();
         view.read_with(cx, |v, _| assert_eq!(v.test_alert, None));
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
+    #[gpui::test]
+    fn relay_options_write_the_config(cx: &mut TestAppContext) {
+        let paths = home("relay");
+        let p = paths.clone();
+        let (view, cx) = cx.add_window_view(move |_, cx| SettingsView::with_usb(p, Page::Settings, false, cx));
+        let read = || std::fs::read_to_string(&paths.config_file).unwrap();
+        assert!(cx.debug_bounds("relay-listen").is_none(), "hidden until ticked");
+        click(cx, "relay-on");
+        assert!(cx.debug_bounds("relay-listen").is_some());
+        assert!(!read().contains("relay_listen"), "nothing written for an empty address");
+        click(cx, "relay-generate");
+        let key = view.read_with(cx, |v, _| v.relay_key_raw.clone());
+        assert_eq!(key.len(), 32);
+        assert!(key.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert!(read().contains(&format!("relay_key = {key}")), "{}", read());
+        view.update(cx, |v, _| v.set_relay(RelayField::Listen, " 100.64.1.2:8790 "));
+        assert!(read().contains("relay_listen = 100.64.1.2:8790\n"), "{}", read());
+        click(cx, "relay-generate");
+        assert_ne!(view.read_with(cx, |v, _| v.relay_key_raw.clone()), key);
+        click(cx, "relay-on"); // Off: the address goes, the key stays for later.
+        assert!(!read().contains("relay_listen"), "{}", read());
+        assert!(read().contains("relay_key = "));
+        assert!(read().starts_with("# mine\n"));
         let _ = std::fs::remove_dir_all(&paths.home);
     }
 

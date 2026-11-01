@@ -22,6 +22,11 @@ pub const DEFAULT_HEARTBEAT_INTERVAL: u64 = 60;
 pub const MIN_INTERVAL: u64 = 10;
 /// GitHub repo the flasher reads releases from.
 pub const DEFAULT_RELEASE_REPO: &str = "HermannBjorgvin/Clawdmeter";
+/// Clawdmeter2 never takes firmware from the original project: its releases
+/// would replace our firmware. Only a `release_repo` set in the config is used.
+pub fn uses_upstream_releases(repo: &str) -> bool {
+    repo.eq_ignore_ascii_case(DEFAULT_RELEASE_REPO)
+}
 /// How lively Clawd is on the device, 1 (No-nonsense) to 5 (All-nonsense).
 pub const LIVELINESS_MIN: u8 = 1;
 /// See [`LIVELINESS_MIN`].
@@ -235,6 +240,10 @@ impl AttentionAnim {
 pub struct Settings {
     /// Claude config dirs to poll (accounts). Default `[~/.claude]`.
     pub config_dirs: Vec<PathBuf>,
+    /// Account emails in number order (`accounts = a, b`); empty when absent.
+    pub accounts: Vec<String>,
+    /// True when the file names accounts (otherwise the daemon seeds them).
+    pub accounts_explicit: bool,
     /// `/usage` poll interval while a session is working (s, >= 10).
     pub poll_interval: u64,
     /// True when `poll_interval` came from the file or the env var, in which
@@ -266,6 +275,13 @@ pub struct Settings {
     pub attention_anim: AttentionAnim,
     /// Pace marker on the device's usage bars (`pm`, default off).
     pub pace_marker: bool,
+    /// clawdmeter2: where to listen for `clawdmeter-relay` messages from a
+    /// server (`relay_listen`, e.g. `100.64.1.2:8790`, the Tailscale address;
+    /// a bare port listens on every interface). `None` = off.
+    pub relay_listen: Option<String>,
+    /// The shared key the relay sends (`relay_key`, 16+ characters). The
+    /// listener stays off without one.
+    pub relay_key: Option<String>,
 }
 
 /// `alert_on`: the alert kinds that show, as a comma list of `permission`,
@@ -374,6 +390,8 @@ impl Settings {
             cfg.get("heartbeat_interval").and_then(parse_interval).unwrap_or(DEFAULT_HEARTBEAT_INTERVAL);
         Settings {
             config_dirs: parse_config_dirs(cfg.get("config_dirs"), paths),
+            accounts: parse_accounts(cfg.get("accounts")),
+            accounts_explicit: !parse_accounts(cfg.get("accounts")).is_empty(),
             poll_interval,
             poll_interval_explicit: file_poll.is_some() || env_default.is_some(),
             heartbeat_interval,
@@ -394,6 +412,14 @@ impl Settings {
             liveliness: cfg.get("liveliness").map(parse_liveliness).unwrap_or(DEFAULT_LIVELINESS),
             attention_anim: cfg.get("attention_anim").map(AttentionAnim::parse).unwrap_or_default(),
             pace_marker: on_off(cfg.get("pace_marker"), false),
+            relay_listen: cfg.get("relay_listen").map(str::trim).filter(|s| !s.is_empty()).map(|s| {
+                if s.parse::<u16>().is_ok() {
+                    format!("0.0.0.0:{s}")
+                } else {
+                    s.to_owned()
+                }
+            }),
+            relay_key: cfg.get("relay_key").map(str::trim).filter(|s| s.len() >= 16).map(str::to_owned),
         }
     }
 
@@ -438,6 +464,9 @@ impl Settings {
                 })
                 .collect();
             cfg.set("config_dirs", &list.join(", "));
+        }
+        if current.accounts != self.accounts {
+            cfg.set("accounts", &self.accounts.join(", "));
         }
         if current.poll_interval != self.poll_interval {
             cfg.set("poll_interval", &self.poll_interval.to_string());
@@ -488,12 +517,35 @@ impl Settings {
     }
 }
 
-/// `config_dirs`: comma list, `~` expanded, blanks dropped; default `[~/.claude]`.
+/// `accounts`: comma list of emails, blanks dropped.
+fn parse_accounts(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or("").split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect()
+}
+
+/// `~/.claude` (always) plus every `~/.claude-*` folder holding
+/// `.credentials.json`, sorted.
+pub fn discover_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut out = vec![home.join(".claude")];
+    let mut found: Vec<PathBuf> = fs::read_dir(home)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".claude-"))
+        .map(|e| e.path())
+        .filter(|p| p.join(".credentials.json").is_file())
+        .collect();
+    found.sort();
+    out.extend(found);
+    out
+}
+
+/// `config_dirs`: comma list, `~` expanded, blanks dropped; default is
+/// `discover_dirs` (at least `[~/.claude]`).
 pub fn parse_config_dirs(raw: Option<&str>, paths: &Paths) -> Vec<PathBuf> {
     let dirs: Vec<PathBuf> =
         raw.unwrap_or("").split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| paths.expand_tilde(s)).collect();
     if dirs.is_empty() {
-        vec![paths.home.join(".claude")]
+        discover_dirs(&paths.home)
     } else {
         dirs
     }
@@ -704,6 +756,51 @@ mod tests {
         let mut n = ConfigFile::parse("a = 1");
         n.set("b", "2");
         assert_eq!(n.render(), "a = 1\nb = 2\n");
+    }
+
+    #[test]
+    fn accounts_parse() {
+        let s = settings(
+            "accounts = a@x, b@x
+",
+        );
+        assert_eq!(s.accounts, vec!["a@x".to_owned(), "b@x".to_owned()]);
+        assert!(s.accounts_explicit);
+        let s = settings(
+            "clock = auto
+",
+        );
+        assert!(s.accounts.is_empty() && !s.accounts_explicit);
+    }
+
+    #[test]
+    fn accounts_save_roundtrip() {
+        let p = paths();
+        let mut c = ConfigFile::parse(
+            "chime = off
+",
+        );
+        let mut s = Settings::from_config(&c, &p, None);
+        s.accounts = vec!["a@x".into(), "b@x".into()];
+        s.accounts_explicit = true;
+        s.apply_to(&mut c, &p);
+        assert!(c.render().contains(
+            "accounts = a@x, b@x
+"
+        ));
+        assert_eq!(Settings::from_config(&c, &p, None), s);
+    }
+
+    #[test]
+    fn discover_dirs_finds_logged_in_folders() {
+        let home = std::env::temp_dir().join(format!("cm-disc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::create_dir_all(home.join(".claude-2")).unwrap();
+        fs::write(home.join(".claude-2/.credentials.json"), "{}").unwrap();
+        fs::create_dir_all(home.join(".claude-x")).unwrap();
+        assert_eq!(discover_dirs(&home), vec![home.join(".claude"), home.join(".claude-2")]);
+        fs::remove_dir_all(&home).ok();
     }
 
     #[test]

@@ -1,0 +1,23 @@
+# clawdmeter-relay config (server side).
+# Copy to ~/.config/clawdmeter-relay/config and edit. Format: key = value.
+# Lines starting with # are ignored. Use full paths, not ~, for accounts.
+# Keep this file private: chmod 600 ~/.config/clawdmeter-relay/config
+
+# The PCs that run the Clawdmeter app: Tailscale names or IPs. The port
+# defaults to 8790. Every message goes to every target; the PC that runs
+# the app takes it.
+targets = desk-pc, laptop
+
+# The same secret as relay_key in each PC's app config (16 or more characters).
+key = replace-with-the-shared-secret
+
+# This server's name, shown in the app's logs. Letters, digits, "-" and "_".
+machine = proxmox
+
+# Claude Code config dirs on this server. Keep the same order as config_dirs
+# in each PC's app config: the first one here is account 1 everywhere.
+accounts = /root/.claude, /root/.claude-acc2
+
+# Optional. A status line you already had. "clawdmeter-relay install" moves
+# it here when it replaces the status line, so it still shows.
+# statusline_command = /root/my-statusline.sh

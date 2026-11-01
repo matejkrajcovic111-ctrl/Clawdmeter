@@ -15,6 +15,8 @@ static uint8_t  candidate_rotation = 0;
 static uint32_t candidate_since    = 0;
 static uint32_t last_poll_ms       = 0;
 static bool     imu_ok             = false;
+static float    last_ax = 0, last_ay = 0, last_az = 0;   // g, the latest poll (clawdmeter2: the pet)
+static bool     have_accel         = false;
 
 static uint8_t accel_to_rotation(float ax, float ay) {
     float abs_ax = fabsf(ax);
@@ -48,6 +50,8 @@ void imu_hal_tick(void) {
 
     float ax, ay, az;
     if (!imu.getAccelerometer(ax, ay, az)) return;
+    last_ax = ax; last_ay = ay; last_az = az;
+    have_accel = true;
 
     uint8_t target = accel_to_rotation(ax, ay);
     if (target == 255 || target == current_rotation) {
@@ -64,3 +68,9 @@ void imu_hal_tick(void) {
 }
 
 uint8_t imu_hal_rotation_quadrant(void) { return current_rotation; }
+
+bool imu_hal_accel(float* x, float* y, float* z) {
+    if (!have_accel) return false;
+    *x = last_ax; *y = last_ay; *z = last_az;
+    return true;
+}

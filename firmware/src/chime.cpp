@@ -199,6 +199,7 @@ static void chime_task(void* arg) {
 }
 
 static void start_playback(void) {
+    Serial.printf("chime: play at %lu ms\n", (unsigned long)millis());
     portENTER_CRITICAL(&state_lock);
     const bool busy = playing;
     playing = true;

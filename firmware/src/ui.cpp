@@ -1,7 +1,18 @@
 #include "ui.h"
 #include "performer.h"
 #include "mascot.h"
+#include "account_tint.h"
+#include "face.h"
+#include "history.h"
 #include "clawd_anim.h"
+#include "tool_icons.h"
+#include "party.h"
+#include "idle.h"
+#include "chime.h"
+LV_FONT_DECLARE(font_styrene_28);
+LV_FONT_DECLARE(font_styrene_24);
+LV_FONT_DECLARE(font_styrene_20);
+LV_FONT_DECLARE(font_styrene_16);
 #include "clawd_policy.h"
 #include "minimal_mode.h"
 #include <lvgl.h>
@@ -25,27 +36,63 @@ static_assert(LAYOUT_LOGO_SLOT == LOGO_HEIGHT && LAYOUT_LOGO_SLOT_SMALL == LOGO_
 static_assert(LAYOUT_LOGO_W == CLAWD_STILL_W && LAYOUT_LOGO_W_SMALL == CLAWD_STILL_SMALL_W, "corner Clawd");
 static_assert(LAYOUT_BATT_W == ICON_BATTERY_W && LAYOUT_BATT_W_SMALL == ICON_BATTERY_SMALL_W, "battery icon");
 
-// Anthropic brand palette — design tokens live in theme.h
+// Anthropic brand palette — design tokens live in theme.h. Account 2 swaps
+// the whole set for the neon one (ui_set_account); the COL_* names read the
+// palette in force, and apply_palette() restyles what's already built.
 #include "theme.h"
+struct Palette {
+    lv_color_t panel, text, dim, accent, green, amber, red, bar_bg;
+    const char *green_hex, *amber_hex, *red_hex, *text_hex;   // for recoloured labels
+};
+static Palette pal_original() {
+    return { THEME_PANEL, THEME_TEXT, THEME_DIM, THEME_ACCENT, THEME_GREEN, THEME_AMBER, THEME_RED,
+             THEME_BAR_BG, "788c5d", "d97757", "c0392b", "faf9f5" };
+}
+static Palette pal_neon() {
+    return { NEON_PANEL, NEON_TEXT, NEON_DIM, NEON_ACCENT, NEON_GREEN, NEON_AMBER, NEON_RED,
+             NEON_BAR_BG, "4aa3ff", "ffb347", "ff3355", "dcebff" };
+}
+static Palette P = pal_original();
+static int palette_idx = 1;
 #define COL_BG        THEME_BG
-#define COL_PANEL     THEME_PANEL
-#define COL_TEXT      THEME_TEXT
-#define COL_DIM       THEME_DIM
-#define COL_ACCENT    THEME_ACCENT
-#define COL_GREEN     THEME_GREEN
-#define COL_AMBER     THEME_AMBER
-#define COL_RED       THEME_RED
-#define COL_BAR_BG    THEME_BAR_BG
+#define COL_PANEL     P.panel
+#define COL_TEXT      P.text
+#define COL_DIM       P.dim
+#define COL_ACCENT    P.accent
+#define COL_GREEN     P.green
+#define COL_AMBER     P.amber
+#define COL_RED       P.red
+#define COL_BAR_BG    P.bar_bg
 
 // ---- Usage screen widgets (single non-splash view) ----
 static lv_obj_t* usage_container;
 static lv_obj_t* lbl_title;
+static lv_obj_t* lbl_acct = nullptr;   // "#N" in the bottom-right corner, with two or more accounts
+static int acct_shown = 1, acct_count = 1;
+static void place_badge(void);
+static int  status_room(void);
+// clawdmeter2: is Claude working in the shown account (`wk`)? -1 = the app
+// doesn't say. Working: the status line runs like Claude Code's spinner.
+// Idle: it says how long the last stretch of work took.
+static int8_t   working = -1;
+// clawdmeter2: nobody is logged into the shown account (`off`): its last
+// reading is on the cards in the palette's dim colours, status line "Logged out".
+static bool     offline = false;
+static bool     offline_line_up = false;   // "Logged out" is what the status line shows now
+static uint32_t working_since = 0;    // lv_tick the current stretch began
+static uint32_t worked_ms = 0;        // the last finished stretch; 0 = none seen
+static int32_t  turn_tokens = -1;     // `wt`: this prompt's output tokens; -1 = not said
 // Clock fed by the daemon: base epoch (local wall-clock seconds) + the lv_tick at
 // which it landed, so the title ticks forward locally between 60s payloads.
 static long     clock_base_epoch = 0;
 static uint32_t clock_base_ms = 0;
+static int      local_hour = -1;      // from the app's clock; -1 until it sends one
+
+int ui_local_hour(void) { return local_hour; }
 static int      clock_fmt = 24;   // 12 or 24, set from the daemon payload
 static int      clock_last_min = -1;   // last rendered minute; avoids redrawing the title every tick
+static uint32_t date_until = 0;        // clawdmeter2: the title shows the date until then (0 = clock)
+#define DATE_SHOW_MS 4000
 static lv_obj_t* usage_group;   // the two usage panels — shown when connected
 static lv_obj_t* pair_group;    // pairing hint — shown when disconnected
 static lv_obj_t* pair_lines[4]; // its lines: heading, two steps, the hold note
@@ -71,7 +118,26 @@ static lv_obj_t* lbl_anim;      // status line: connection state + whimsical idl
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
 static lv_obj_t* logo_img;
-static lv_image_dsc_t battery_dscs[6];  // empty, low, medium, full, charging, plug-zap (no battery)
+static lv_image_dsc_t battery_dscs[6];
+static lv_image_dsc_t battery_empty_red;   // clawdmeter2: the empty outline in red, <= 10 %  // empty, low, medium, full, charging, plug-zap (no battery)
+// clawdmeter2: a tap on the icon shows the percentage in its place for a while.
+static lv_obj_t* lbl_batt_pct = nullptr;
+static uint32_t  batt_pct_until = 0;   // 0 = the icon is shown
+static int       batt_last_pct = -1;
+static bool      batt_last_chg = false;
+static bool      batt_last_usb = false;
+#define BATT_PCT_SHOW_MS 4000
+static void init_battery_icons_white(void);
+#define BATT_GREEN 0x2BFF5E   // the charging bar: a bright, vivid green
+static void apply_battery_visibility(void);
+// clawdmeter2: burn-in guard. Everything that never moves (the meters, the
+// clock, the badge, the battery) sits a few px off its spot, a new spot every
+// SHIFT_EVERY_MS, walking a small ring so each pixel takes turns.
+#define SHIFT_EVERY_MS (3u * 60u * 1000u)
+static int8_t   shift_x = 0, shift_y = 0;
+static void batt_shift_parts(void);   // the charging fill / pulse / bolt (defined with them)
+static void batt_icon_pop(void);
+static void batt_charge_init(lv_obj_t* scr);
 
 // ---- Live-data freshness → which usage sub-view to show ----
 // Live meters when data is flowing; the same meters dimmed when the host is
@@ -152,9 +218,174 @@ static uint8_t fitting_verb(uint8_t i) {
     for (uint8_t n = 0; n < ANIM_MSG_COUNT; n++, i = (i + 1) % ANIM_MSG_COUNT) {
         char buf[48];
         snprintf(buf, sizeof(buf), "%s %s\xE2\x80\xA6", spinner_frames[1], anim_messages[i]);
-        if (layout_text_width(L.status_font, buf) <= L.status_w) return i;
+        if (layout_text_width(L.status_font, buf) <= status_room()) return i;
     }
     return i;
+}
+
+// ---- clawdmeter2: the status line while Claude works, like Claude Code's ----
+// The glyph spins, a lighter shimmer sweeps across the verb, and the time
+// spent so far follows in grey. Idle, it says how long the last stretch took
+// with a past-tense verb ("Brewed for 1m 23s"). Drawn with LVGL's recolor
+// markup ("#rrggbb text#"), switched on only for these lines: other lines
+// (facts, alerts) can hold a literal '#'.
+#define SHIMMER_STEP_MS 80    // the shimmer moves one letter per step
+#define SHIMMER_TAIL    4     // steps it rests past the end before coming round
+#define STATS_EVERY_MS  15000 // the numbers take over the line this often...
+#define STATS_SHOW_MS   4000  // ...for this long
+static uint32_t spin_last_ms = 0;
+static uint8_t  past_idx = 0;
+static const char* const past_verbs[] = {
+    "Worked", "Baked", "Brewed", "Churned", "Cooked", "Crunched",
+    "Mulled", "Pondered", "Simmered", "Stewed", "Noodled", "Whirred",
+};
+#define PAST_COUNT (sizeof(past_verbs) / sizeof(past_verbs[0]))
+
+static void format_span(uint32_t ms, char* out, size_t n) {
+    const uint32_t s = ms / 1000;
+    if (s < 60)        snprintf(out, n, "%us", (unsigned)s);
+    else if (s < 3600) snprintf(out, n, "%um %us", (unsigned)(s / 60), (unsigned)(s % 60));
+    else               snprintf(out, n, "%uh %um", (unsigned)(s / 3600), (unsigned)(s % 3600 / 60));
+}
+
+static void hex_of(lv_color_t c, char out[7]) {
+    snprintf(out, 7, "%02x%02x%02x", c.red, c.green, c.blue);
+}
+
+// In LVGL's lv_label.c, though no header of this version declares it.
+extern "C" void lv_label_set_recolor(lv_obj_t* obj, bool en);
+static bool status_recolor = false;
+static char idle_shown[64];   // the idle line on screen; "" = something else is
+
+// clawdmeter2: the tool Claude is running (`tl`), as an icon after the verb
+// (helpers after status_room()).
+static char cur_tool[6] = "";
+struct ToolIcon;
+static const ToolIcon* tool_icon_for(const char* code);
+static void tool_icon_off(void);
+static void tool_icon_on(const ToolIcon* ic, int plain_w, lv_color_t c);
+
+static void set_status(const char* text, bool recolor) {
+    tool_icon_off();
+    idle_shown[0] = 0;
+    offline_line_up = false;
+    if (status_recolor != recolor) {
+        lv_label_set_recolor(lbl_anim, recolor);
+        status_recolor = recolor;
+    }
+    lv_label_set_text(lbl_anim, text);
+}
+
+// Claude Code's spinner colours: the verb and glyph in its "claude" orange,
+// the shimmer in its lighter "claudeShimmer". Account 2's blue gets the same
+// treatment.
+#define CC_SPINNER       0xD77757
+#define CC_SHIMMER       0xEB9F7F
+#define CC_SPINNER_BLUE  0x4AA3FF
+#define CC_SHIMMER_BLUE  0x9CCBFF
+// Thinking: Claude Code's dark-theme "warning" amber and its shimmer.
+#define CC_THINK         0xFFC107
+#define CC_THINK_SHIMMER 0xFFDF39
+#define THINK_FADE_MS    600   // orange <-> amber fade
+static int8_t thinking = -1;
+void ui_set_thinking(int t) { thinking = t < 0 ? -1 : t > 0 ? 1 : 0; }
+
+// "<glyph> <Verb>…", the verb with a shimmer at `now`.
+static void draw_working_line(const char* glyph, const char* verb, uint32_t now) {
+    static char buf[420];
+    char base[7], mid[7], hi[7], dim[7], gc[7];
+    // clawdmeter2: thinking and not fade into each other (THINK_FADE_MS)
+    // instead of flipping colour from one frame to the next.
+    static uint16_t think_mix = 0;     // 0 = the account colour, 255 = thinking amber
+    static uint32_t think_mix_ms = 0;
+    const uint16_t want = thinking == 1 ? 255 : 0;
+    const uint32_t dt = now - think_mix_ms;
+    think_mix_ms = now;
+    if (think_mix != want) {
+        const uint32_t step = dt >= THINK_FADE_MS ? 255 : dt * 255 / THINK_FADE_MS;
+        if (want > think_mix) think_mix = think_mix + step >= want ? want : think_mix + step;
+        else                  think_mix = think_mix <= want + step ? want : think_mix - step;
+    }
+    const lv_color_t nb = lv_color_hex(g_account_tint ? CC_SPINNER_BLUE : CC_SPINNER);
+    const lv_color_t ns = lv_color_hex(g_account_tint ? CC_SHIMMER_BLUE : CC_SHIMMER);
+    const lv_color_t b = lv_color_mix(lv_color_hex(CC_THINK), nb, (uint8_t)think_mix);
+    const lv_color_t s = lv_color_mix(lv_color_hex(CC_THINK_SHIMMER), ns, (uint8_t)think_mix);
+    hex_of(b, base);
+    hex_of(lv_color_mix(s, b, 128), mid);
+    hex_of(s, hi);
+    hex_of(COL_DIM, dim);
+    hex_of(b, gc);
+
+    // Mostly the verb; every STATS_EVERY_MS the line swaps to the numbers for
+    // STATS_SHOW_MS: time on this stretch and today's tokens for the account.
+    const uint32_t elapsed = now - working_since;
+    if (elapsed >= STATS_EVERY_MS && elapsed % STATS_EVERY_MS < STATS_SHOW_MS) {
+        char span[16], tok[16], plain[64];
+        format_span(elapsed, span, sizeof(span));
+        if (turn_tokens >= 0) {   // this prompt's tokens, as Claude Code counts them
+            history_format_tokens((uint64_t)turn_tokens, tok, sizeof(tok));
+            snprintf(plain, sizeof(plain), "%s %s \xC2\xB7 %s tokens", glyph, span, tok);
+            if (layout_text_width(L.status_font, plain) > status_room())
+                snprintf(plain, sizeof(plain), "%s %s \xC2\xB7 %s", glyph, span, tok);
+            if (layout_text_width(L.status_font, plain) > status_room())
+                snprintf(plain, sizeof(plain), "%s %s", glyph, tok);
+        } else {
+            snprintf(plain, sizeof(plain), "%s %s", glyph, span);
+        }
+        snprintf(buf, sizeof(buf), "#%s %s# #%s %s#", gc, glyph, dim, plain + strlen(glyph) + 1);
+        set_status(buf, true);
+        return;
+    }
+
+    const int len = (int)strlen(verb);
+    const int pos = (int)((now / SHIMMER_STEP_MS) % (uint32_t)(len + SHIMMER_TAIL * 2)) - SHIMMER_TAIL;
+    int o = snprintf(buf, sizeof(buf), "#%s %s# ", gc, glyph);
+    const char* run = nullptr;
+    for (int i = 0; i < len && o < (int)sizeof(buf) - 24; i++) {
+        const int d = i > pos ? i - pos : pos - i;
+        const char* c = d == 0 ? hi : d == 1 ? mid : base;
+        if (c != run) {
+            if (run) o += snprintf(buf + o, sizeof(buf) - o, "#");
+            o += snprintf(buf + o, sizeof(buf) - o, "#%s ", c);
+            run = c;
+        }
+        buf[o++] = verb[i];
+    }
+    o += snprintf(buf + o, sizeof(buf) - o, "#");
+    snprintf(buf + o, sizeof(buf) - o, "#%s \xE2\x80\xA6#", base);
+    set_status(buf, true);
+    if (const ToolIcon* ic = tool_icon_for(cur_tool)) {
+        char plain[64];
+        snprintf(plain, sizeof(plain), "%s %s\xE2\x80\xA6", glyph, verb);
+        tool_icon_on(ic, layout_text_width(L.status_font, plain), b);
+    }
+}
+
+// Idle: "✻ Brewed for 1m 23s" (or "Idle" before any stretch), in grey.
+// Returns false when the line is already up.
+static bool draw_idle_line(void) {
+    char buf[64];
+    char dim[7];
+    hex_of(COL_DIM, dim);
+    if (worked_ms >= 1000) {
+        // The longest form that fits beside the #N badge: "✻ Churned for
+        // 1h 2m 3s", then without "for", then just the time.
+        char span[16], plain[48];
+        format_span(worked_ms, span, sizeof(span));
+        const char* verb = past_verbs[past_idx];
+        snprintf(plain, sizeof(plain), "\xE2\x9C\xBB %s for %s", verb, span);
+        if (layout_text_width(L.status_font, plain) > status_room())
+            snprintf(plain, sizeof(plain), "\xE2\x9C\xBB %s %s", verb, span);
+        if (layout_text_width(L.status_font, plain) > status_room())
+            snprintf(plain, sizeof(plain), "\xE2\x9C\xBB %s", span);
+        snprintf(buf, sizeof(buf), "#%s %s#", dim, plain);
+    } else {
+        snprintf(buf, sizeof(buf), "#%s \xE2\x9C\xBB Idle#", dim);
+    }
+    if (strcmp(buf, idle_shown) == 0) return false;
+    set_status(buf, true);
+    snprintf(idle_shown, sizeof(idle_shown), "%s", buf);
+    return true;
 }
 
 static lv_color_t pct_color(float pct) {
@@ -287,7 +518,44 @@ static lv_obj_t* make_pill(lv_obj_t* parent, const char* text) {
     return lbl;
 }
 
+// clawdmeter2: the level bars in colour (3 green, 2 orange, 1 red), the
+// outline stays white. A bar pixel is one the empty battery doesn't have, so
+// each level icon is copied to RAM once and just those pixels repainted.
+#define BATT_ORANGE 0xFF9F1C
+#define BATT_RED    0xFF453A
+static void tint_battery_bars(lv_image_dsc_t* lvl, const lv_image_dsc_t* empty, uint32_t rgb) {
+    const int n = lvl->header.w * lvl->header.h;
+    if (empty->header.w != lvl->header.w || empty->header.h != lvl->header.h) return;
+    uint8_t* buf = (uint8_t*)malloc(lvl->data_size);
+    if (!buf) return;   // keep the white icon
+    memcpy(buf, lvl->data, lvl->data_size);
+    const uint8_t* a_lvl = buf + n * 2;
+    const uint8_t* a_empty = empty->data + n * 2;
+    const uint16_t c = lv_color_to_u16(lv_color_hex(rgb));
+    uint16_t* px = (uint16_t*)buf;
+    for (int i = 0; i < n; i++)
+        if (a_lvl[i] > 0 && a_empty[i] < 128) px[i] = c;
+    lvl->data = buf;
+}
+
 static void init_battery_icons(void) {
+    init_battery_icons_white();
+    tint_battery_bars(&battery_dscs[1], &battery_dscs[0], BATT_RED);
+    tint_battery_bars(&battery_dscs[2], &battery_dscs[0], BATT_ORANGE);
+    tint_battery_bars(&battery_dscs[3], &battery_dscs[0], BATT_GREEN);
+    // The empty battery (<= 10 %): the whole outline in red.
+    battery_empty_red = battery_dscs[0];
+    uint8_t* buf = (uint8_t*)malloc(battery_dscs[0].data_size);
+    if (buf) {
+        const int n = battery_dscs[0].header.w * battery_dscs[0].header.h;
+        memcpy(buf, battery_dscs[0].data, battery_dscs[0].data_size);
+        const uint16_t c = lv_color_to_u16(lv_color_hex(BATT_RED));
+        for (int i = 0; i < n; i++) ((uint16_t*)buf)[i] = c;
+        battery_empty_red.data = buf;
+    }
+}
+
+static void init_battery_icons_white(void) {
     if (L.small_icons) {
         init_icon_dsc_rgb565a8(&battery_dscs[0], ICON_BATTERY_SMALL_W, ICON_BATTERY_SMALL_H, icon_battery_small_data);
         init_icon_dsc_rgb565a8(&battery_dscs[1], ICON_BATTERY_LOW_SMALL_W, ICON_BATTERY_LOW_SMALL_H, icon_battery_low_small_data);
@@ -395,15 +663,95 @@ void ui_set_pair_hint(PairHint hint) {
 // The title's font follows the clock format (a 12-hour clock may need a
 // smaller one); hidden where the header has no room for it at all.
 static void apply_title_font(void) {
+    if (date_until && clock_base_epoch > 0) return;   // the date has the title for now
     const int fmt = clock_base_epoch > 0 && clock_fmt == 12 ? 1 : 0;
     const lv_font_t* f = L.title_font[fmt];
     if (!f) {
         lv_obj_add_flag(lbl_title, LV_OBJ_FLAG_HIDDEN);
+        place_badge();
         return;
     }
     lv_obj_set_style_text_font(lbl_title, f, 0);
     lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, L.title_cx - L.w / 2, L.title_y[fmt]);
     lv_obj_clear_flag(lbl_title, LV_OBJ_FLAG_HIDDEN);
+    place_badge();
+}
+
+// The "#N" badge just right of the title's baseline; hidden with one
+// account, or where it would run into the battery.
+static void place_badge(void) {
+    if (!lbl_acct) return;
+    if (acct_count < 2) {
+        lv_obj_add_flag(lbl_acct, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    // Bottom-right, on the status line's centre line, at the cards' right edge
+    // (or the status line's, on a round panel where the corner is cut off).
+    lv_label_set_text_fmt(lbl_acct, "#%d", acct_shown);
+    int right = L.card[0].x + L.card[0].w;
+    if (L.w / 2 + L.status_w / 2 < right) right = L.w / 2 + L.status_w / 2;
+    const int status_h = lv_font_get_line_height(L.status_font);
+    const int lift = (status_h - lv_font_get_line_height(L.pill_font)) / 2;
+    lv_obj_align(lbl_acct, LV_ALIGN_BOTTOM_RIGHT, right - L.w, L.status_y - (lift > 0 ? lift : 0));
+    lv_obj_clear_flag(lbl_acct, LV_OBJ_FLAG_HIDDEN);
+}
+
+// The status line's usable width: with the badge up it keeps clear of it on
+// both sides, so the centred text never runs under it.
+static int status_room(void) {
+    if (acct_count < 2) return L.status_w;
+    const int badge = layout_text_width(L.pill_font, "#9") + (L.small_icons ? 4 : 10);
+    return L.status_w - 2 * badge;
+}
+
+// clawdmeter2: the tool Claude is running (`tl`), as an icon after the verb.
+static lv_obj_t* tool_img = nullptr;
+static lv_image_dsc_t tool_dsc;
+static const ToolIcon* tool_shown = nullptr;
+static bool      tool_on = false;
+
+void ui_set_tool(const char* code) {
+    snprintf(cur_tool, sizeof(cur_tool), "%s", code ? code : "");
+}
+
+static const ToolIcon* tool_icon_for(const char* code) {
+    if (!code || !code[0]) return nullptr;
+    const ToolIcon* table = L.small_icons ? TOOL_ICONS_SMALL : TOOL_ICONS;
+    const int n = (int)(sizeof(TOOL_ICONS) / sizeof(TOOL_ICONS[0]));
+    for (int i = 0; i < n; i++)
+        if (strcmp(table[i].code, code) == 0) return &table[i];
+    return &table[n - 1];   // "ot"
+}
+
+// Hide the icon and put the line back in the middle.
+static void tool_icon_off(void) {
+    if (!tool_on) return;
+    tool_on = false;
+    if (tool_img) lv_obj_add_flag(tool_img, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, L.status_y);
+}
+
+// Show `ic` after the status text (`plain_w` px wide), tinted `c`; the pair
+// stays centred. Skipped when it wouldn't fit beside the badges.
+static void tool_icon_on(const ToolIcon* ic, int plain_w, lv_color_t c) {
+    const int gap = L.small_icons ? 4 : 8;
+    if (!ic || plain_w + gap + ic->w > status_room()) { tool_icon_off(); return; }
+    if (!tool_img) {
+        tool_img = lv_image_create(usage_container);
+        lv_obj_clear_flag(tool_img, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_image_recolor_opa(tool_img, LV_OPA_COVER, 0);
+    }
+    if (ic != tool_shown) {
+        init_icon_dsc_rgb565a8(&tool_dsc, ic->w, ic->h, ic->data);
+        lv_image_set_src(tool_img, &tool_dsc);
+        tool_shown = ic;
+    }
+    lv_obj_set_style_image_recolor(tool_img, c, 0);
+    lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, -(gap + ic->w) / 2, L.status_y);
+    lv_obj_update_layout(lbl_anim);
+    lv_obj_align_to(tool_img, lbl_anim, LV_ALIGN_OUT_RIGHT_MID, gap, 0);
+    lv_obj_clear_flag(tool_img, LV_OBJ_FLAG_HIDDEN);
+    tool_on = true;
 }
 
 static void init_usage_screen(lv_obj_t* scr) {
@@ -419,6 +767,12 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_label_set_text(lbl_title, "Usage");
     lv_obj_set_style_text_color(lbl_title, COL_TEXT, 0);
     apply_title_font();
+
+    lbl_acct = lv_label_create(usage_container);
+    lv_label_set_text(lbl_acct, "#1");
+    lv_obj_set_style_text_font(lbl_acct, L.pill_font, 0);
+    lv_obj_set_style_text_color(lbl_acct, COL_ACCENT, 0);
+    lv_obj_add_flag(lbl_acct, LV_OBJ_FLAG_HIDDEN);
 
     // Usage panels (shown when connected) live in a transparent full-size group
     // so they can be toggled against the pairing hint as one unit.
@@ -477,6 +831,29 @@ static void init_usage_screen(lv_obj_t* scr) {
 // ---- Attention message on the status line (the director sequences the rest).
 static bool alert_active = false;
 static const char* still_shown = nullptr;   // minimal mode: status word on screen
+static const char* notice_text = nullptr;   // ui_set_notice
+static const char* notice_shown = nullptr;
+
+void ui_set_notice(const char* text) {
+    notice_text = text;
+    notice_shown = nullptr;
+    // Back to the usual line: make every path redraw on the next tick.
+    anim_last_ms = 0;
+    still_shown = nullptr;
+    frozen_shown = nullptr;
+}
+
+// clawdmeter2 facts that take turns with the whimsy (run-out, use-next, machines).
+static char info_text[UI_INFO_COUNT][40];
+
+void ui_set_info(UiInfo slot, const char* text) {
+    if (slot < 0 || slot >= UI_INFO_COUNT) return;
+    const char* t = text ? text : "";
+    if (strcmp(info_text[slot], t) == 0) return;
+    snprintf(info_text[slot], sizeof(info_text[slot]), "%s", t);
+    // Same buffer, new words: the frozen-line check compares pointers.
+    if (frozen_shown == info_text[slot]) frozen_shown = nullptr;
+}
 
 // ======== Public API ========
 
@@ -510,6 +887,11 @@ void ui_init(void) {
     if (!board_caps().has_battery) {
         lv_obj_del(battery_img);
         battery_img = nullptr;
+    } else {
+        batt_charge_init(scr);
+        lbl_batt_pct = lv_label_create(scr);
+        lv_obj_set_style_text_font(lbl_batt_pct, L.pill_font, 0);
+        lv_obj_add_flag(lbl_batt_pct, LV_OBJ_FLAG_HIDDEN);
     }
 
     // Corner mascot in the old logo slot. The still Clawd is shorter than the
@@ -549,6 +931,13 @@ void ui_init(void) {
 
 // The Pro/Max bars' fill colours and pace markers.
 static void apply_bar_colors(const UsageData* data) {
+    if (offline) {   // logged out: dim fills, no pace markers
+        lv_obj_set_style_bg_color(bar_session, COL_DIM, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(bar_weekly, COL_DIM, LV_PART_INDICATOR);
+        place_pace_tick(tick_session, -1.0f);
+        place_pace_tick(tick_weekly, -1.0f);
+        return;
+    }
     if (data->enterprise) {
         // Spending has no 5-hour window, and the Period bar (coloured in
         // ui_update) already is the elapsed share: no markers.
@@ -571,12 +960,12 @@ void ui_set_pace_marker(bool on) {
     if (have_last_data) apply_bar_colors(&last_data);
 }
 
+static void render_usage(const UsageData* data);
+
 void ui_update(const UsageData* data) {
     if (!data->valid) return;
     data_ok = data->ok;
     if (!data->ok) return;          // a {"ok":false} "no data" beat → fall through to idle, keep last numbers
-    last_data = *data;
-    have_last_data = true;
     last_data_ms = lv_tick_get();   // a real usage update just landed
     data_received = true;
 
@@ -592,7 +981,88 @@ void ui_update(const UsageData* data) {
         lv_label_set_text(lbl_title, "Usage");
         apply_title_font();
     }
+    render_usage(data);
+}
 
+// clawdmeter2: the title (clock <-> date) drops in from just above with a
+// little bounce. Only translate + text opacity: no layer buffer needed.
+static void title_exec(void* obj, int32_t v) {   // v: 0..1000
+    lv_obj_t* o = (lv_obj_t*)obj;
+    lv_obj_set_style_translate_y(o, -(int32_t)L.w / 24 * (1000 - v) / 1000, 0);
+    lv_obj_set_style_text_opa(o, (lv_opa_t)(v > 1000 ? 255 : v * 255 / 1000), 0);
+}
+static void title_pop(void) {
+    if (!lbl_title) return;
+    lv_anim_delete(lbl_title, title_exec);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, lbl_title);
+    lv_anim_set_exec_cb(&a, title_exec);
+    lv_anim_set_values(&a, 0, 1000);
+    lv_anim_set_duration(&a, 380);
+    lv_anim_set_path_cb(&a, lv_anim_path_overshoot);
+    lv_anim_start(&a);
+}
+
+// clawdmeter2: a swipe's transition. The two cards fly in one after the
+// other from the side the finger came from, overshoot a touch and settle,
+// like dealt cards. Only translate_x moves (a whole-group opacity forces a
+// full-screen layer per frame, which made it stutter); the title, Clawd and
+// the status line stay put.
+#define SLIDE_MS     340
+#define SLIDE_STAGGER 70
+static void slide_exec(void* obj, int32_t v) { lv_obj_set_style_translate_x((lv_obj_t*)obj, v, 0); }
+
+void ui_slide_in(int finger_dir) {
+    if (!usage_group || minimal_mode()) return;
+    const int32_t from = -(finger_dir >= 0 ? 1 : -1) * (L.w * 3 / 4);
+    const uint32_t n = lv_obj_get_child_count(usage_group);
+    for (uint32_t i = 0; i < n; i++) {
+        lv_obj_t* c = lv_obj_get_child(usage_group, i);
+        lv_anim_delete(c, slide_exec);
+        lv_obj_set_style_translate_x(c, from, 0);
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, c);
+        lv_anim_set_exec_cb(&a, slide_exec);
+        lv_anim_set_values(&a, from, 0);
+        lv_anim_set_duration(&a, SLIDE_MS);
+        // Cards in reading order: the top one leads.
+        lv_anim_set_delay(&a, (lv_obj_get_y(c) > L.card[0].y + L.card[0].h / 2) ? SLIDE_STAGGER : 0);
+        lv_anim_set_path_cb(&a, lv_anim_path_overshoot);
+        lv_anim_start(&a);
+    }
+}
+
+void ui_show(const UsageData* view) {
+    if (!view->valid || !view->ok || !have_last_data) return;
+    render_usage(view);
+}
+
+// clawdmeter2: session usage warning. Crossing 80 % glows the edge amber,
+// 95 % red with a chime; once per level per account until the session resets
+// (the % drops back under 50).
+#define WARN_SLOTS 8
+static void check_usage_warning(const UsageData* d) {
+    static uint8_t warned[WARN_SLOTS] = {};   // 0 none, 1 = 80 % done, 2 = 95 % done
+    if (d->enterprise) return;
+    const int slot = d->account_idx > 0 ? (d->account_idx - 1) % WARN_SLOTS : 0;
+    const float p = d->session_pct;
+    if (p < 50.0f) { warned[slot] = 0; return; }
+    if (p >= 95.0f && warned[slot] < 2) {
+        warned[slot] = 2;
+        if (!minimal_mode()) party_glow(lv_color_hex(0xFF453A), 3);
+        if (!idle_is_asleep()) chime_play();
+    } else if (p >= 80.0f && warned[slot] < 1) {
+        warned[slot] = 1;
+        if (!minimal_mode()) party_glow(lv_color_hex(0xFFC107), 2);
+    }
+}
+
+static void render_usage(const UsageData* data) {
+    last_data = *data;
+    have_last_data = true;
+    check_usage_warning(data);
     int s_pct = (int)(data->session_pct + 0.5f);
 
     if (data->enterprise) {
@@ -619,11 +1089,11 @@ void ui_update(const UsageData* data) {
     // Pace vars used in both enterprise blocks below
     const char* pace_text = "Under pace";
     lv_color_t  pace_color = COL_GREEN;
-    const char* pace_hex   = "788c5d";   // matches THEME_GREEN
+    const char* pace_hex   = P.green_hex;
     if (data->session_pct > (float)data->time_pct + 15.0f) {
-        pace_text = "Over pace";  pace_color = COL_RED;   pace_hex = "c0392b";
+        pace_text = "Over pace";  pace_color = COL_RED;   pace_hex = P.red_hex;
     } else if (data->session_pct > (float)data->time_pct - 15.0f) {
-        pace_text = "On pace";    pace_color = COL_AMBER; pace_hex = "d97757";
+        pace_text = "On pace";    pace_color = COL_AMBER; pace_hex = P.amber_hex;
     }
 
     if (data->enterprise) {
@@ -650,8 +1120,8 @@ void ui_update(const UsageData* data) {
         if (L.period_short)
             snprintf(buf, sizeof(buf), "#%s Resets %s#", pace_hex, data->reset_date);
         else
-            snprintf(buf, sizeof(buf), "#%s %s# - #faf9f5 Resets %s#",
-                     pace_hex, pace_text, data->reset_date);
+            snprintf(buf, sizeof(buf), "#%s %s# - #%s Resets %s#",
+                     pace_hex, pace_text, P.text_hex, data->reset_date);
         lv_obj_set_style_text_font(lbl_weekly_reset, L.period_font, 0);
         lv_label_set_text(lbl_weekly_reset, buf);
     } else {
@@ -696,13 +1166,69 @@ static void update_view_state(void) {
 
 bool ui_meters_live(void) { return view_state == 2; }
 
+// Move the still parts to the next spot of the ring (+-2 px, +-1 on small panels).
+static void shift_apply(lv_obj_t* o) {
+    if (!o) return;
+    lv_obj_set_style_translate_x(o, shift_x, 0);
+    lv_obj_set_style_translate_y(o, shift_y, 0);
+}
+static void shift_tick(void) {
+    static uint32_t last = 0;
+    static uint8_t  spot = 0;
+    const uint32_t now = lv_tick_get();
+    if (last && now - last < SHIFT_EVERY_MS) return;
+    last = now ? now : 1;
+    static const int8_t RING[8][2] = { {0,0}, {1,0}, {1,1}, {0,1}, {-1,1}, {-1,0}, {-1,-1}, {0,-1} };
+    const int k = L.small_icons ? 1 : 2;
+    spot = (uint8_t)((spot + 1) % 8);
+    shift_x = (int8_t)(RING[spot][0] * k);
+    shift_y = (int8_t)(RING[spot][1] * k);
+    shift_apply(usage_container);
+    shift_apply(battery_img);
+    batt_shift_parts();
+    shift_apply(lbl_batt_pct);
+}
+
+// clawdmeter2: a long run (time or tokens) glows the screen edge once.
+#define LONG_RUN_MS     (15u * 60u * 1000u)
+#define LONG_RUN_TOKENS 200000
+static uint32_t long_run_for = 0;   // working_since of the stretch that already glowed (0 = none)
+
+static void check_long_run(void) {
+    if (working != 1 || !working_since) return;
+    const uint32_t now = lv_tick_get();
+    // A new stretch (its start moved by more than a few seconds) may glow again.
+    if (long_run_for && (working_since - long_run_for) > 5000u && (long_run_for - working_since) > 5000u)
+        long_run_for = 0;
+    if (long_run_for) return;
+    if (now - working_since >= LONG_RUN_MS || turn_tokens >= LONG_RUN_TOKENS) {
+        long_run_for = working_since ? working_since : 1;
+        Serial.printf("ui: long run (%us, %d tokens)\n", (unsigned)((now - working_since) / 1000), (int)turn_tokens);
+        if (!minimal_mode()) party_glow(lv_color_hex(CC_THINK), 3);
+        if (!idle_is_asleep()) chime_play();
+    }
+}
+
 void ui_tick_anim(void) {
+    check_long_run();
+    shift_tick();
+    if (batt_pct_until && (int32_t)(lv_tick_get() - batt_pct_until) >= 0) {   // back to the icon
+        batt_pct_until = 0;
+        apply_battery_visibility();
+        batt_icon_pop();
+    }
     update_view_state();
     if (pair_hint == PAIR_HINT_CLEARED && lv_tick_get() - pair_hint_since >= PAIR_CLEARED_SHOW_MS)
         ui_set_pair_hint(PAIR_HINT_NORMAL);
     const bool still = minimal_mode();   // minimal: nothing moves but the numbers
 
     uint32_t now = lv_tick_get();
+    if (clock_base_epoch > 0) {
+        const long cur = clock_base_epoch + (long)((now - clock_base_ms) / 1000);
+        local_hour = (int)((cur % 86400 + 86400) % 86400 / 3600);
+    } else {
+        local_hour = -1;
+    }
 
     // Title clock: once the daemon has sent wall-clock time, replace "Usage" with
     // the live time, advanced locally so it ticks every minute between payloads.
@@ -710,7 +1236,13 @@ void ui_tick_anim(void) {
         time_t cur = (time_t)(clock_base_epoch + (now - clock_base_ms) / 1000);
         struct tm tmv;
         gmtime_r(&cur, &tmv);   // epoch is already local wall-clock → gmtime keeps it as-is
-        if (tmv.tm_min != clock_last_min) {   // only rewrite the title when the minute changes
+        if (date_until && (int32_t)(now - date_until) >= 0) {   // the date's turn is over
+            date_until = 0;
+            apply_title_font();
+            clock_last_min = -1;
+            title_pop();
+        }
+        if (!date_until && tmv.tm_min != clock_last_min) {   // only rewrite the title when the minute changes
             clock_last_min = tmv.tm_min;
             char tbuf[12];
             if (clock_fmt == 12) {
@@ -722,10 +1254,33 @@ void ui_tick_anim(void) {
                 snprintf(tbuf, sizeof(tbuf), "%02d:%02d", tmv.tm_hour, tmv.tm_min);
             }
             lv_label_set_text(lbl_title, tbuf);
+            place_badge();
         }
     }
 
     if (alert_active) return;          // the status line holds the alert message
+    if (notice_text) {
+        if (notice_text != notice_shown) {
+            notice_shown = notice_text;
+            static char nbuf[64];
+            snprintf(nbuf, sizeof(nbuf), "%s %s", spinner_frames[1], notice_text);
+            set_status(nbuf, false);
+        }
+        return;
+    }
+
+    if (offline && s_ble_connected) {
+        // Logged out: the line says so, in the dim colour, and holds still.
+        if (!offline_line_up) {
+            char dimhex[7];
+            hex_of(COL_DIM, dimhex);
+            static char obuf[40];
+            snprintf(obuf, sizeof(obuf), "#%s ✻ Logged out#", dimhex);
+            set_status(obuf, true);
+            offline_line_up = true;
+        }
+        return;
+    }
 
     if (still) {
         // One glyph, one word per state; redrawn only when it changes.
@@ -735,7 +1290,7 @@ void ui_tick_anim(void) {
             still_shown = text;
             static char sbuf[40];
             snprintf(sbuf, sizeof(sbuf), "%s %s", spinner_frames[1], text);
-            lv_label_set_text(lbl_anim, sbuf);
+            set_status(sbuf, false);
         }
         return;
     }
@@ -750,12 +1305,21 @@ void ui_tick_anim(void) {
         anim_msg_start = now;
     }
 
-    if (tune.spinner) {
-        if (now - anim_last_ms < spinner_ms[anim_spinner_idx]) return;
+    // clawdmeter2: with the app's `wk`, the verbs run only while Claude works
+    // (shimmering, like Claude Code); idle, the line holds still.
+    const bool settled = s_ble_connected && view_state == 2 && now - connected_at_ms >= 5000;
+    const bool idle = settled && working == 0;
+    const bool busy = settled && working == 1 && tune.spinner;
+
+    if (tune.spinner && !idle) {
+        if (now - anim_last_ms < (busy ? SHIMMER_STEP_MS : spinner_ms[anim_spinner_idx])) return;
         anim_last_ms = now;
-        anim_phase = (anim_phase + 1) % SPINNER_PHASES;
-        anim_spinner_idx = (anim_phase < SPINNER_COUNT) ? anim_phase
-                                                        : (SPINNER_PHASES - anim_phase);
+        if (now - spin_last_ms >= spinner_ms[anim_spinner_idx]) {
+            spin_last_ms = now;
+            anim_phase = (anim_phase + 1) % SPINNER_PHASES;
+            anim_spinner_idx = (anim_phase < SPINNER_COUNT) ? anim_phase
+                                                            : (SPINNER_PHASES - anim_phase);
+        }
         frozen_shown = nullptr;
     } else {
         anim_spinner_idx = 1;
@@ -771,6 +1335,28 @@ void ui_tick_anim(void) {
         text = "Connected";
     } else {
         text = anim_messages[anim_verb_idx];
+        // clawdmeter2: every other verb is a fact (ui_set_info), in turn.
+        const char* facts[UI_INFO_COUNT];
+        int nf = 0;
+        for (int i = 0; i < UI_INFO_COUNT; i++)
+            if (info_text[i][0]) facts[nf++] = info_text[i];
+        if (nf > 0 && (anim_msg_idx & 1)) {
+            const char* f = facts[(anim_msg_idx / 2) % nf];
+            if ((!tune.spinner || idle) && f == frozen_shown) return;
+            frozen_shown = f;
+            static char ibuf[80];
+            snprintf(ibuf, sizeof(ibuf), "%s %s", spinner_frames[anim_spinner_idx], f);
+            set_status(ibuf, false);
+            return;
+        }
+        if (idle) {
+            if (draw_idle_line()) frozen_shown = nullptr;
+            return;
+        }
+        if (busy) {
+            draw_working_line(spinner_frames[anim_spinner_idx], text, now);
+            return;
+        }
     }
 
     if (!tune.spinner) {
@@ -782,11 +1368,201 @@ void ui_tick_anim(void) {
     static char buf[80];
     snprintf(buf, sizeof(buf), "%s %s\xE2\x80\xA6",
              spinner_frames[anim_spinner_idx], text);
-    lv_label_set_text(lbl_anim, buf);
+    set_status(buf, false);
+}
+
+// ---- clawdmeter2: battery percentage on tap + charging fill ----
+// While charging the icon is the plain outline with a green bar inside at the
+// charge level, a soft pulse running from there to full (what's left to
+// charge) and the bolt on top.
+static lv_obj_t* batt_fill = nullptr;   // the charge level
+static lv_obj_t* batt_flow = nullptr;   // pulse from the level to full
+static lv_obj_t* batt_bolt = nullptr;
+static lv_point_precise_t batt_bolt_pts[4];
+static int       batt_shown_pct = -2;   // what the fill was last set to
+static bool      batt_shown_chg = false;
+
+// Inside of the outline (lucide battery: rect 2..18 x 6..18 in a 24 grid,
+// stroke 2), one grid unit in from the stroke.
+static int batt_scale(void) { return L.small_icons ? 1 : 2; }
+static int batt_in_x(void)  { return L.batt_x + 4 * batt_scale(); }
+static int batt_in_y(void)  { return L.batt_y + 8 * batt_scale(); }
+static int batt_in_w(void)  { return 12 * batt_scale(); }
+static int batt_in_h(void)  { return 8 * batt_scale(); }
+
+static void batt_flow_exec(void* obj, int32_t v) {   // v: 0..1000 of the way to full
+    lv_obj_t* o = (lv_obj_t*)obj;
+    const int lvl = batt_in_w() * (batt_last_pct < 0 ? 0 : batt_last_pct) / 100;
+    const int w = lvl + (batt_in_w() - lvl) * v / 1000;
+    lv_obj_set_width(o, w < 1 ? 1 : w);
+    lv_obj_set_style_bg_opa(o, (lv_opa_t)(110 * (1000 - v) / 1000), 0);
+}
+
+static lv_obj_t* batt_bar(lv_obj_t* parent, lv_opa_t opa) {
+    lv_obj_t* o = lv_obj_create(parent);
+    lv_obj_remove_style_all(o);
+    lv_obj_set_style_bg_color(o, lv_color_hex(BATT_GREEN), 0);
+    lv_obj_set_style_bg_opa(o, opa, 0);
+    lv_obj_set_style_radius(o, batt_scale(), 0);
+    lv_obj_set_pos(o, batt_in_x(), batt_in_y());
+    lv_obj_set_size(o, 1, batt_in_h());
+    lv_obj_clear_flag(o, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+    return o;
+}
+
+static void batt_charge_init(lv_obj_t* scr) {
+    batt_fill = batt_bar(scr, LV_OPA_COVER);
+    batt_flow = batt_bar(scr, 110);
+    const int k = batt_scale();
+    // The charging icon's bolt: m11 7 -3 5 h4 l-3 5.
+    const int16_t bx[4] = { 11, 8, 12, 9 }, by[4] = { 7, 12, 12, 17 };
+    for (int i = 0; i < 4; i++) {
+        batt_bolt_pts[i].x = bx[i] * k;
+        batt_bolt_pts[i].y = by[i] * k;
+    }
+    batt_bolt = lv_line_create(scr);
+    lv_line_set_points(batt_bolt, batt_bolt_pts, 4);
+    lv_obj_set_style_line_width(batt_bolt, 2 * k, 0);
+    lv_obj_set_style_line_rounded(batt_bolt, true, 0);
+    lv_obj_set_style_line_color(batt_bolt, COL_TEXT, 0);
+    lv_obj_set_pos(batt_bolt, L.batt_x, L.batt_y);
+    lv_obj_clear_flag(batt_bolt, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(batt_bolt, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Fill + pulse for the current reading (only touched when it changes).
+static void batt_charge_apply(void) {
+    if (!batt_fill) return;
+    const bool on = batt_last_chg && batt_last_pct >= 0;
+    if (on == batt_shown_chg && batt_last_pct == batt_shown_pct) return;
+    batt_shown_chg = on;
+    batt_shown_pct = batt_last_pct;
+    lv_anim_delete(batt_flow, batt_flow_exec);
+    if (!on) return;
+    int w = batt_in_w() * batt_last_pct / 100;
+    lv_obj_set_width(batt_fill, w < 2 ? 2 : w);
+    if (batt_last_pct < 100 && !minimal_mode()) {
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, batt_flow);
+        lv_anim_set_exec_cb(&a, batt_flow_exec);
+        lv_anim_set_values(&a, 0, 1000);
+        lv_anim_set_duration(&a, 1400);
+        lv_anim_set_repeat_delay(&a, 500);
+        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+        lv_anim_start(&a);
+    } else {
+        lv_obj_set_style_bg_opa(batt_flow, LV_OPA_TRANSP, 0);
+    }
+}
+
+static void batt_shift_parts(void) {
+    lv_obj_t* const parts[3] = { batt_fill, batt_flow, batt_bolt };
+    for (lv_obj_t* o : parts) {
+        if (!o) continue;
+        lv_obj_set_style_translate_x(o, shift_x, 0);
+        lv_obj_set_style_translate_y(o, shift_y, 0);
+    }
+}
+
+// The same rise-and-fade the clock does when the date comes and goes.
+static void batt_pop_exec(void* obj, int32_t v) {   // v: 0..1000 (overshoots)
+    lv_obj_t* o = (lv_obj_t*)obj;
+    lv_obj_set_style_translate_y(o, shift_y - (int32_t)L.w / 24 * (1000 - v) / 1000, 0);
+    lv_obj_set_style_opa(o, (lv_opa_t)(v > 1000 ? 255 : v < 0 ? 0 : v * 255 / 1000), 0);
+}
+static void batt_pop(lv_obj_t* o) {
+    if (!o) return;
+    lv_anim_delete(o, batt_pop_exec);
+    lv_obj_set_style_translate_y(o, shift_y, 0);
+    lv_obj_set_style_opa(o, LV_OPA_COVER, 0);
+    if (minimal_mode()) return;
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, o);
+    lv_anim_set_exec_cb(&a, batt_pop_exec);
+    lv_anim_set_values(&a, 0, 1000);
+    lv_anim_set_duration(&a, 380);
+    lv_anim_set_path_cb(&a, lv_anim_path_overshoot);
+    lv_anim_start(&a);
+}
+
+// The percentage label in the icon's place: text, colour, font and position.
+// The font is the clock's family (Styrene), the biggest that fits between
+// the title and the right edge, on the title's centre line.
+static void batt_pct_refresh(void) {
+    if (!lbl_batt_pct || !battery_img) return;
+    char buf[8];
+    if (batt_last_pct < 0) snprintf(buf, sizeof(buf), batt_last_usb ? "USB" : "--");
+    else                   snprintf(buf, sizeof(buf), "%d%%", batt_last_pct);
+    lv_label_set_text(lbl_batt_pct, buf);
+    lv_obj_set_style_text_color(lbl_batt_pct, lv_color_white(), 0);   // always white
+
+    const int icon = L.small_icons ? LAYOUT_BATT_W_SMALL : LAYOUT_BATT_W;
+    const int right = L.batt_x + icon;
+    int left = L.batt_x - 4;
+    int mid_y = L.batt_y + icon / 2;
+    int max_h = 0;
+    if (lbl_title && !lv_obj_has_flag(lbl_title, LV_OBJ_FLAG_HIDDEN)) {
+        lv_area_t t;
+        lv_obj_get_coords(lbl_title, &t);
+        if (t.x2 + 8 < left) left = t.x2 + 8;
+        mid_y = (t.y1 + t.y2) / 2;
+        max_h = lv_font_get_line_height(lv_obj_get_style_text_font(lbl_title, LV_PART_MAIN));
+    }
+    const lv_font_t* const fonts[] = { &font_styrene_28, &font_styrene_24, &font_styrene_20, &font_styrene_16 };
+    const lv_font_t* f = &font_styrene_16;
+    for (const lv_font_t* cand : fonts) {
+        if (max_h && lv_font_get_line_height(cand) > max_h) continue;
+        if (layout_text_width(cand, buf) <= right - left) { f = cand; break; }
+    }
+    lv_obj_set_style_text_font(lbl_batt_pct, f, 0);
+    lv_obj_update_layout(lbl_batt_pct);
+    lv_obj_set_pos(lbl_batt_pct, right - lv_obj_get_width(lbl_batt_pct),
+                   mid_y - lv_obj_get_height(lbl_batt_pct) / 2);
+}
+
+static void batt_set_hidden(lv_obj_t* o, bool hide) {
+    if (!o) return;
+    if (hide) lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+    else      lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void apply_battery_visibility(void) {
-    if (battery_img) lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
+    if (!battery_img) return;
+    const bool pct = batt_pct_until != 0;
+    const bool chg = batt_shown_chg;
+    batt_set_hidden(battery_img, pct);
+    batt_set_hidden(batt_fill, pct || !chg);
+    batt_set_hidden(batt_flow, pct || !chg);
+    batt_set_hidden(batt_bolt, pct || !chg);
+    batt_set_hidden(lbl_batt_pct, !pct);
+}
+
+// The icon (and its charging parts) come back with the pop.
+static void batt_icon_pop(void) {
+    batt_pop(battery_img);
+    if (batt_shown_chg) {
+        batt_pop(batt_fill);
+        batt_pop(batt_bolt);
+    }
+}
+
+void ui_show_battery_pct(void) {
+    if (!battery_img || !lbl_batt_pct) return;
+    if (batt_pct_until) {   // a second tap: straight back to the icon
+        batt_pct_until = 0;
+        apply_battery_visibility();
+        batt_icon_pop();
+        return;
+    }
+    batt_pct_until = lv_tick_get() + BATT_PCT_SHOW_MS;
+    if (!batt_pct_until) batt_pct_until = 1;
+    batt_pct_refresh();
+    apply_battery_visibility();
+    batt_pop(lbl_batt_pct);
 }
 
 void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) {
@@ -801,15 +1577,20 @@ void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) 
 
 void ui_update_battery(int percent, bool charging, bool usb_power) {
     if (!battery_img) return;
+    batt_last_pct = percent;
+    batt_last_chg = charging;
+    batt_last_usb = usb_power;
+    if (batt_pct_until) batt_pct_refresh();
+    batt_charge_apply();
     int idx;
     if (percent < 0 && usb_power) {
         idx = 5;   // no battery, running on USB: show the plug-zap glyph, not an empty battery
     } else if (charging) {
-        idx = 4;
+        idx = batt_fill ? 0 : 4;   // the outline, filled by batt_charge_apply
     } else if (percent < 0) {
         idx = 0;
     } else if (percent <= 10) {
-        idx = 0;
+        idx = 6;   // the red outline
     } else if (percent <= 35) {
         idx = 1;
     } else if (percent <= 75) {
@@ -817,7 +1598,7 @@ void ui_update_battery(int percent, bool charging, bool usb_power) {
     } else {
         idx = 3;
     }
-    lv_image_set_src(battery_img, &battery_dscs[idx]);
+    lv_image_set_src(battery_img, idx == 6 ? &battery_empty_red : &battery_dscs[idx]);
     apply_battery_visibility();
 }
 
@@ -829,7 +1610,7 @@ void ui_set_alert_text(const char* message) {
                                                         : LV_LABEL_LONG_SCROLL_CIRCULAR);
         // One line: without a fixed height LONG_DOT would wrap onto the cards.
         lv_obj_set_size(lbl_anim, L.status_w, lv_font_get_line_height(L.status_font));
-        lv_label_set_text(lbl_anim, message);
+        set_status(message, false);
         return;
     }
     if (!alert_active) return;
@@ -839,4 +1620,178 @@ void ui_set_alert_text(const char* message) {
     anim_last_ms = 0;          // whimsical line redraws on the next tick
     still_shown = nullptr;
     frozen_shown = nullptr;
+}
+
+// ======== Accounts (clawdmeter2) ========
+
+static void style_pill(lv_obj_t* pill) {
+    lv_obj_set_style_text_color(pill, offline ? COL_DIM : COL_TEXT, 0);
+    lv_obj_set_style_bg_color(pill, COL_BAR_BG, 0);
+}
+
+// Restyle everything built with the previous palette.
+static void apply_palette(void) {
+    lv_obj_set_style_text_color(lbl_title, COL_TEXT, 0);
+    lv_obj_set_style_text_color(lbl_acct, COL_ACCENT, 0);
+    lv_obj_t* panels[] = { panel_session, panel_weekly };
+    for (lv_obj_t* p : panels) if (p) lv_obj_set_style_bg_color(p, COL_PANEL, 0);
+    lv_obj_t* bars[] = { bar_session, bar_weekly };
+    for (lv_obj_t* b : bars) lv_obj_set_style_bg_color(b, COL_BAR_BG, LV_PART_MAIN);
+    style_pill(lbl_session_label);
+    style_pill(lbl_weekly_label);
+    lv_obj_t* text[] = { lbl_session_pct, lbl_weekly_pct, lbl_session_pct_sym };
+    for (lv_obj_t* t : text) lv_obj_set_style_text_color(t, offline ? COL_DIM : COL_TEXT, 0);
+    lv_obj_t* dim[] = { lbl_session_reset, lbl_weekly_reset, lbl_spending_desc };
+    for (lv_obj_t* t : dim) lv_obj_set_style_text_color(t, COL_DIM, 0);
+    lv_obj_t* ticks[] = { tick_session, tick_weekly };
+    for (lv_obj_t* t : ticks) lv_obj_set_style_bg_color(t, COL_TEXT, 0);
+    lv_obj_set_style_text_color(lbl_anim, COL_ACCENT, 0);
+    if (pair_lines[0]) {
+        lv_obj_set_style_text_color(pair_lines[0], COL_TEXT, 0);
+        lv_obj_set_style_text_color(pair_lines[1], COL_DIM, 0);
+        lv_obj_set_style_text_color(pair_lines[2], COL_DIM, 0);
+        apply_pair_text();
+    }
+    if (have_last_data) render_usage(&last_data);   // bar fills and the recoloured period line
+}
+
+void ui_set_offline(bool off) {
+    if (off == offline) return;
+    offline = off;
+    offline_line_up = false;
+    // The line that was up is gone or stale: every cached status redraws.
+    idle_shown[0] = 0;
+    still_shown = nullptr;
+    frozen_shown = nullptr;
+    anim_last_ms = 0;
+    if (!lbl_session_pct) return;   // UI not built yet
+    lv_obj_t* text[] = { lbl_session_pct, lbl_weekly_pct, lbl_session_pct_sym };
+    for (lv_obj_t* t : text) if (t) lv_obj_set_style_text_color(t, off ? COL_DIM : COL_TEXT, 0);
+    style_pill(lbl_session_label);
+    style_pill(lbl_weekly_label);
+    // Bar fills follow with the render that comes next (ui_show / ui_update).
+}
+
+void ui_set_working(int w) {
+    const int8_t now_w = w < 0 ? -1 : w > 0 ? 1 : 0;
+    const uint32_t t = lv_tick_get();
+    if (now_w == 1 && working != 1) working_since = t;
+    if (now_w != 1 && working == 1) {   // a stretch ended: "Brewed for 1m 23s"
+        worked_ms = t - working_since;
+        past_idx = (uint8_t)((past_idx + 1 + t % 5) % PAST_COUNT);
+    }
+    working = now_w;
+}
+
+void ui_set_turn(int32_t tokens, int32_t secs) {
+    turn_tokens = tokens;
+    // The app knows when the prompt began: the timer matches Claude Code's
+    // even across a reboot or a swipe.
+    if (secs >= 0 && working == 1) working_since = lv_tick_get() - (uint32_t)secs * 1000u;
+}
+
+void ui_set_account(int shown, int count) {
+    if (shown < 1) shown = 1;
+    if (count < 1) count = 1;
+    const int want = count >= 2 && shown == 2 ? 2 : 1;
+    const bool changed = shown != acct_shown || count != acct_count;
+    acct_shown = shown;
+    acct_count = count;
+    if (want != palette_idx) {
+        palette_idx = want;
+        P = want == 2 ? pal_neon() : pal_original();
+        g_account_tint = want == 2;   // Clawd matches the account
+        mascot_retint();
+        mascot_account_changed();     // and he's that account's Clawd, doing his own thing
+        performer_retint();
+        face_set_tint(want == 2);     // a face already up (peek, pet, screensaver) too
+        apply_palette();
+    }
+    if (changed) {
+        place_badge();
+        anim_verb_idx = fitting_verb(anim_verb_idx);   // the badge takes room
+        // Another account's work: its times aren't known here yet.
+        working = -1;
+        worked_ms = 0;
+    }
+}
+
+int ui_account_palette(void) { return palette_idx; }
+
+static bool inside(lv_obj_t* o, int x, int y) {
+    if (!o || lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN)) return false;
+    lv_area_t a;
+    lv_obj_get_coords(o, &a);
+    return x >= a.x1 && x <= a.x2 && y >= a.y1 && y <= a.y2;
+}
+
+// clawdmeter2: a tap on the clock shows the date and year for a few seconds,
+// in the largest title font that fits between Clawd's seat and the battery.
+void ui_show_date(void) {
+    if (clock_base_epoch <= 0 || lv_obj_has_flag(lbl_title, LV_OBJ_FLAG_HIDDEN)) return;
+    const uint32_t now = lv_tick_get();
+    if (date_until) {   // a second tap: straight back to the clock
+        date_until = 0;
+        apply_title_font();
+        clock_last_min = -1;
+        title_pop();
+        return;
+    }
+    const time_t cur = (time_t)(clock_base_epoch + (now - clock_base_ms) / 1000);
+    struct tm tmv;
+    gmtime_r(&cur, &tmv);
+    static const char* const DAYS[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    static const char* const MONTHS[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    char longer[24], shorter[16];
+    snprintf(longer, sizeof(longer), "%s %d %s %d", DAYS[tmv.tm_wday % 7], tmv.tm_mday,
+             MONTHS[tmv.tm_mon % 12], tmv.tm_year + 1900);
+    snprintf(shorter, sizeof(shorter), "%d %s %d", tmv.tm_mday, MONTHS[tmv.tm_mon % 12], tmv.tm_year + 1900);
+
+    const int logo_r = L.logo_x + (L.small_icons ? LAYOUT_LOGO_W_SMALL : LAYOUT_LOGO_W);
+    const int batt = L.batt_x > 0 ? L.batt_x : L.w;
+    const int half = (L.title_cx - logo_r < batt - L.title_cx ? L.title_cx - logo_r : batt - L.title_cx) - 6;
+    const lv_font_t* clock_font = lv_obj_get_style_text_font(lbl_title, LV_PART_MAIN);
+    const lv_font_t* const fonts[] = { clock_font, &font_styrene_28, &font_styrene_24, &font_styrene_20,
+                                       &font_styrene_16 };
+    const char* text = nullptr;
+    const lv_font_t* f = nullptr;
+    // A font that lacks a letter (the big clock face is digits only) measures
+    // short and draws the letter from a fallback; skip it.
+    auto has_all = [](const lv_font_t* fo, const char* s) {
+        lv_font_glyph_dsc_t g;
+        for (; *s; s++)
+            if (*s != ' ' && !lv_font_get_glyph_dsc(fo, &g, (uint32_t)(uint8_t)*s, 0)) return false;
+        return true;
+    };
+    for (const lv_font_t* cand : fonts) {
+        if (lv_font_get_line_height(cand) > lv_font_get_line_height(clock_font)) continue;
+        if (!has_all(cand, longer)) continue;
+        if (layout_text_width(cand, longer) <= 2 * half) { text = longer; f = cand; break; }
+        if (layout_text_width(cand, shorter) <= 2 * half) { text = shorter; f = cand; break; }
+    }
+    if (!f) return;
+    const int fmt = clock_fmt == 12 ? 1 : 0;
+    // On the clock's centre line.
+    const int y = L.title_y[fmt] + (lv_font_get_line_height(clock_font) - lv_font_get_line_height(f)) / 2;
+    lv_label_set_text(lbl_title, text);
+    lv_obj_set_style_text_font(lbl_title, f, 0);
+    title_pop();
+    lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, L.title_cx - L.w / 2, y);
+    date_until = now + DATE_SHOW_MS;
+    if (!date_until) date_until = 1;
+}
+
+UiHit ui_hit_test(int x, int y) {
+    if (view_state == 0) return UI_HIT_NONE;   // the pairing hint owns the screen
+    // The header band: Clawd's seat on the left, then the title and the strip
+    // it sits in.
+    const int logo_r = L.logo_x + (L.small_icons ? LAYOUT_LOGO_W_SMALL : LAYOUT_LOGO_W);
+    if (y < L.card[0].y && x <= logo_r) return UI_HIT_CLAWD;
+    if (y < L.card[0].y && x > logo_r && (!battery_img || x < L.batt_x))
+        return UI_HIT_TITLE;
+    if (y < L.card[0].y && battery_img && x >= L.batt_x) return UI_HIT_BATTERY;
+    if (inside(panel_session, x, y)) return UI_HIT_SESSION;
+    if (inside(panel_weekly, x, y)) return UI_HIT_WEEKLY;
+    return UI_HIT_NONE;
 }

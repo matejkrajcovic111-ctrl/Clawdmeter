@@ -60,6 +60,10 @@ fn main() {
     if args.first().map(String::as_str) == Some("hook") {
         std::process::exit(clawdmeter_app::hooks::main(&args[1..]));
     }
+    // The same for Claude Code's status line (clawdmeter2: live usage).
+    if args.first().map(String::as_str) == Some("statusline") {
+        std::process::exit(clawdmeter_app::statusline::main());
+    }
     let paths = Paths::for_user();
     if args.is_empty() {
         logger::init_with_file(&paths.state_dir.join("daemon.log"));

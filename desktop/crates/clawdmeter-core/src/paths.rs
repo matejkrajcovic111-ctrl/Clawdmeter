@@ -70,6 +70,11 @@ impl Paths {
         self.state_dir.join("usage-blocks.json")
     }
 
+    /// The account book (numbers by email, folder logins, last readings).
+    pub fn accounts_file(&self) -> PathBuf {
+        self.state_dir.join("accounts.json")
+    }
+
     /// Downloaded firmware images.
     pub fn firmware_cache(&self) -> PathBuf {
         self.cache_dir.join("firmware")

@@ -31,7 +31,7 @@ void clawd_tuning_defaults(ClawdTuning* t) {
     t->reactions         = true;
     t->show_min_activity = 3;
     t->idle_gap_pct      = 100;
-    t->verb_ms           = 4 * SEC;
+    t->verb_ms           = 12 * SEC;   // clawdmeter2: was 4 s, felt too busy
     t->spinner           = true;
 }
 

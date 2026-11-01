@@ -1,0 +1,16 @@
+[package]
+name = "clawdmeter-relay"
+description = "Forwards Claude Code hook events and token totals from a headless machine (a server) to the Clawdmeter app over the network."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Pure Rust (std + serde), no TLS and no C: it cross-compiles to a static
+# Linux binary from any host with rust-lld. Run it over a private network
+# (Tailscale/WireGuard); requests carry a shared key.
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true

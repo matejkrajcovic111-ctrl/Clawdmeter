@@ -84,9 +84,10 @@ static int16_t widest_clock(const lv_font_t* f, bool h12) {
 
 // ─── The tuned designs ───────────────────────────────────────────────────────
 
-// Fonts a title steps down through, largest first.
+// Fonts a title steps down through, largest first. clawdmeter2: the clock is
+// set in Styrene, the face of the cards' numbers, not Tiempos.
 static const lv_font_t* const TITLE_FONTS[] = {
-    &font_tiempos_56, &font_tiempos_34, &font_styrene_24, &font_styrene_16, &font_styrene_14,
+    &font_styrene_48, &font_styrene_28, &font_styrene_24, &font_styrene_16, &font_styrene_14,
 };
 #define TITLE_FONT_COUNT (int)(sizeof(TITLE_FONTS) / sizeof(TITLE_FONTS[0]))
 
@@ -319,7 +320,11 @@ static void fit_period(Layout& L) {
 static bool place_flow(Layout& L, const Design& d, const Chrome** chrome) {
     const Chrome& c = *(*chrome = d.chrome);
     place_header(L, c, c.margin, L.w - c.margin, 0);
-    L.title_cx = L.w / 2 + c.title_nudge;
+    // clawdmeter2: the clock sits in the true middle; the nudge clear of the
+    // corner Clawd is only used when the centred clock wouldn't fit.
+    L.title_cx = L.w / 2;
+    fit_title(L, c);
+    if (!L.title_font[0]) L.title_cx = L.w / 2 + c.title_nudge;
     L.status_y = -c.status_inset;
     L.status_w = L.w - 2 * d.margin;
     L.pair_w = L.w - d.margin;     // free text keeps half a margin off the edges

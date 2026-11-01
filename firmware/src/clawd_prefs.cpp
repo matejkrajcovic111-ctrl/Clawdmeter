@@ -2,6 +2,7 @@
 #include "clawd_director.h"
 #include "clawd_policy.h"
 #include "ui.h"
+#include "accounts.h"
 #include <Preferences.h>
 #include <Arduino.h>
 
@@ -11,7 +12,9 @@ void clawd_prefs_init(void) {
     const int lively = prefs.getUChar("lively", CLAWD_LIVELINESS_DEFAULT);
     const int attn = prefs.getUChar("attn_anim", CLAWD_ATTN_ANIM_DEFAULT_S);
     const bool pace = prefs.getUChar("pace_mark", 0) != 0;
+    const int shown = prefs.getUChar("acct_shown", 0);
     prefs.end();
+    accounts_restore(shown);
     director_set_liveliness(clawd_liveliness_clamp(lively));
     director_set_attn_anim(clawd_attn_anim_clamp(attn));
     pace_marker_set(pace);
@@ -57,3 +60,7 @@ void pace_marker_set(bool on) {
 }
 
 bool pace_marker_get(void) { return pace_marker; }
+
+void shown_account_save(int idx) {
+    save("acct_shown", (uint8_t)(idx < 0 ? 0 : idx));
+}

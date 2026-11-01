@@ -72,22 +72,25 @@ struct Items {
     update: MenuItem,
     settings: MenuItem,
     quit: MenuItem,
+    /// "Open Claude #N" entries, one per configured account.
+    claude: Vec<MenuItem>,
 }
 
 impl Items {
     fn new() -> Self {
         let it = Items {
             menu: Menu::new(),
-            status: MenuItem::new("Clawdmeter · Starting", false, None),
+            status: MenuItem::new("Clawdmeter2 · Starting", false, None),
             account: MenuItem::new("No usage data yet", false, None),
             session: MenuItem::new("Session  –", false, None),
             weekly: MenuItem::new("Weekly  –", false, None),
             refresh: MenuItem::new("Refresh usage", true, None),
             mute: CheckMenuItem::new("Mute chimes", true, false, None),
-            open: MenuItem::new("Open Clawdmeter", true, None),
+            open: MenuItem::new("Open Clawdmeter2", true, None),
             update: MenuItem::new("Flash firmware…", true, None),
             settings: MenuItem::new("Settings…", true, None),
-            quit: MenuItem::new("Quit Clawdmeter", true, None),
+            quit: MenuItem::new("Quit Clawdmeter2", true, None),
+            claude: Vec::new(),
         };
         let _ = it.menu.append_items(&[
             &it.status,
@@ -108,13 +111,28 @@ impl Items {
         it
     }
 
+    /// Keep one "Open Claude #N" entry per account, ahead of "Open Clawdmeter2".
+    fn sync_claude(&mut self, n: usize) {
+        if self.claude.len() == n {
+            return;
+        }
+        for it in self.claude.drain(..) {
+            let _ = self.menu.remove(&it);
+        }
+        for i in 0..n {
+            let it = MenuItem::new(format!("Open Claude #{}", i + 1), true, None);
+            let _ = self.menu.insert(&it, 9 + i);
+            self.claude.push(it);
+        }
+    }
+
     fn update(&self, snap: &StatusSnapshot, paths: &Paths, chimes_on: bool, now: i64) {
         let state = snap.tray_state();
         let mut label = state.label().to_owned();
         if snap.link == "no_adapter" {
             label = "Bluetooth unavailable".into();
         }
-        self.status.set_text(format!("Clawdmeter · {label}"));
+        self.status.set_text(format!("Clawdmeter2 · {label}"));
         let account = snap.account.as_deref().map(|a| tilde(a, &paths.home));
         self.account.set_text(match (account, snap.age(now)) {
             (Some(a), Some(age)) => format!("{a} · updated {}", ago(age)),
@@ -153,7 +171,7 @@ fn icon_for(state: TrayState) -> Option<Icon> {
 }
 
 fn tooltip(snap: &StatusSnapshot) -> String {
-    let mut t = format!("Clawdmeter · {}", snap.tray_state().label());
+    let mut t = format!("Clawdmeter2 · {}", snap.tray_state().label());
     if let (Some(s), Some(w)) = (snap.session_pct, snap.week_pct) {
         t.push_str(&format!(" · Session {s}% · Weekly {w}%"));
     }
@@ -247,6 +265,45 @@ impl TrayApp {
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             let Some(items) = &self.items else { continue };
             let id = ev.id;
+            if let Some(i) = items.claude.iter().position(|m| *m.id() == id) {
+                let home = &self.paths.home;
+                match (
+                    self.settings.accounts.get(i),
+                    clawdmeter_core::usage::find_claude(self.settings.claude_path.as_deref(), home),
+                ) {
+                    (Some(email), Some(claude)) => {
+                        let book =
+                            clawdmeter_core::identity::AccountBook::load(&self.paths.state_dir.join("accounts.json"))
+                                .unwrap_or_else(|_| {
+                                    clawdmeter_core::identity::AccountBook::new(self.settings.accounts.clone())
+                                });
+                        let (dir, create) = crate::accounts::folder_for(email, &book, &self.settings.config_dirs, home);
+                        if create {
+                            if let Err(e) = std::fs::create_dir_all(&dir) {
+                                log::warn!("{}: {e}", dir.display());
+                            }
+                            // Keep the local copy current so a second click before the
+                            // next reload doesn't make another folder.
+                            if !self.settings.config_dirs.contains(&dir) {
+                                self.settings.config_dirs.push(dir.clone());
+                            }
+                            let d = dir.clone();
+                            if let Err(e) = crate::ui::settings::write_settings(&self.paths, |s, _| {
+                                if !s.config_dirs.contains(&d) {
+                                    s.config_dirs.push(d);
+                                }
+                            }) {
+                                log::warn!("config: {e}");
+                            }
+                        }
+                        if let Err(e) = crate::accounts::open_claude(&claude, &dir, home, i + 1) {
+                            log::warn!("{e}");
+                        }
+                    }
+                    _ => log::warn!("Open Claude #{}: account or claude not found", i + 1),
+                }
+                continue;
+            }
             let cmd = if id == *items.refresh.id() {
                 Some(AppCommand::Refresh)
             } else if id == *items.mute.id() {
@@ -298,7 +355,8 @@ impl TrayApp {
         if now - self.menu_at >= MENU_REFRESH_SECS || self.last_written.as_ref().is_none_or(|w| !w.same_content(&snap))
         {
             self.menu_at = now;
-            if let Some(items) = &self.items {
+            if let Some(items) = &mut self.items {
+                items.sync_claude(self.settings.accounts.len());
                 items.update(&snap, &self.paths, self.settings.alert_chime || self.settings.desktop_chime, now);
             }
             if let Some(t) = &self.tray {
@@ -324,11 +382,12 @@ impl TrayApp {
     }
 
     fn create_tray(&mut self) {
-        let items = Items::new();
+        let mut items = Items::new();
+        items.sync_claude(self.settings.accounts.len());
         let built = TrayIconBuilder::new()
             .with_id("clawdmeter")
             .with_menu(Box::new(items.menu.clone()))
-            .with_tooltip("Clawdmeter")
+            .with_tooltip("Clawdmeter2")
             .with_icon(icon_for(TrayState::Searching).expect("icon"))
             .build();
         match built {
@@ -372,16 +431,24 @@ fn spawn_update_checker(paths: Paths, latest: Arc<Mutex<Option<String>>>, now_fl
             if forced || (enabled && check.due(unix_now())) {
                 let repo =
                     settings.map(|s| s.release_repo).unwrap_or_else(|| clawdmeter_flash::DEFAULT_RELEASE_REPO.into());
-                match clawdmeter_flash::release::release_for_app(&repo, crate::version()) {
-                    Ok(r) => {
-                        log::info!("latest firmware release: {}", r.manifest.version);
-                        let _ = std::fs::create_dir_all(&paths.cache_dir);
-                        let _ = std::fs::write(ipc::latest_release_file(&paths), &r.manifest.version);
-                        if let Ok(mut l) = latest.lock() {
-                            *l = Some(r.manifest.version);
-                        }
+                if clawdmeter_core::config::uses_upstream_releases(&repo) {
+                    // No online releases for Clawdmeter2; never offer upstream firmware.
+                    let _ = std::fs::remove_file(ipc::latest_release_file(&paths));
+                    if let Ok(mut l) = latest.lock() {
+                        *l = None;
                     }
-                    Err(e) => log::info!("update check: {e} ({})", e.detail().unwrap_or_default()),
+                } else {
+                    match clawdmeter_flash::release::release_for_app(&repo, crate::version()) {
+                        Ok(r) => {
+                            log::info!("latest firmware release: {}", r.manifest.version);
+                            let _ = std::fs::create_dir_all(&paths.cache_dir);
+                            let _ = std::fs::write(ipc::latest_release_file(&paths), &r.manifest.version);
+                            if let Ok(mut l) = latest.lock() {
+                                *l = Some(r.manifest.version);
+                            }
+                        }
+                        Err(e) => log::info!("update check: {e} ({})", e.detail().unwrap_or_default()),
+                    }
                 }
                 let _ = check.mark(unix_now());
             }
@@ -428,7 +495,7 @@ pub fn run(paths: Paths) -> i32 {
         Ok(None) => {
             // Already running: show its window instead of starting a second
             // daemon. (A headless `--daemon` holder ignores this.)
-            log::info!("Clawdmeter is already running; opening its window");
+            log::info!("Clawdmeter2 is already running; opening its window");
             let _ = ipc::send_command(&paths, &AppCommand::Open(Page::Overview.as_str().into()));
             return 0;
         }
@@ -442,7 +509,7 @@ pub fn run(paths: Paths) -> i32 {
 }
 
 fn run_locked(paths: Paths, _lock: Option<std::fs::File>) -> i32 {
-    log::info!("=== Clawdmeter {} ===", crate::version());
+    log::info!("=== Clawdmeter2 {} ===", crate::version());
     // An AppImage renews the binary copy its hooks run (see launch::hook_binary).
     if std::env::var_os("APPIMAGE").is_some() {
         let _ = crate::hooks::install::hook_binary(&paths.state_dir);

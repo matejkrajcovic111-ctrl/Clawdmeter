@@ -13,3 +13,5 @@ void attn_anim_set(int seconds);      // apply; saved only when it changes
 int  attn_anim_get(void);
 void pace_marker_set(bool on);      // apply; saved only when it changes
 bool pace_marker_get(void);
+// The account the user swiped to (accounts.h); 0 = follow the app.
+void shown_account_save(int idx);

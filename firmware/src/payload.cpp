@@ -1,6 +1,7 @@
 #include "payload.h"
 #include <ArduinoJson.h>
 #include <string.h>
+#include <stdio.h>
 
 // strlcpy isn't in every host libc; this is all we need of it.
 static void copy_str(char* dst, size_t cap, const char* src) {
@@ -58,6 +59,7 @@ bool payload_parse(const char* json, UsageData* out, const char** err) {
         int v = n | 0;
         d.sessions = (int16_t)(v < 0 ? 0 : v > 999 ? 999 : v);
     }
+    copy_str(d.machines, sizeof d.machines, doc["sm"] | "");
     d.replay = doc["rp"].as<bool>();
     JsonVariant lv = doc["lv"];
     if (lv.isNull()) {
@@ -76,6 +78,49 @@ bool payload_parse(const char* json, UsageData* out, const char** err) {
 
     JsonVariant pm = doc["pm"];
     d.pace_marker = pm.isNull() ? -1 : (int8_t)((pm | 0) ? 1 : 0);
+
+    // ---- accounts (optional) ----
+    JsonVariant ai = doc["ai"];
+    if (ai.isNull()) {
+        d.account_idx = -1;
+    } else {
+        int v = ai | 1;
+        d.account_idx = (int8_t)(v < 1 ? 1 : v > 9 ? 9 : v);
+    }
+    JsonVariant ac = doc["ac"];
+    if (ac.isNull()) {
+        d.account_count = -1;
+    } else {
+        int v = ac | 1;
+        d.account_count = (int8_t)(v < 1 ? 1 : v > 9 ? 9 : v);
+    }
+    JsonVariant wk = doc["wk"];
+    d.working = wk.isNull() ? -1 : (int8_t)((wk | 0) ? 1 : 0);
+    d.turn_tokens = doc["wt"] | -1;
+    d.turn_secs = doc["wd"] | -1;
+    snprintf(d.tool, sizeof(d.tool), "%s", (const char*)(doc["tl"] | ""));
+    JsonVariant th = doc["th"];
+    d.thinking = th.isNull() ? -1 : (int8_t)((th | 0) ? 1 : 0);
+    d.other_count = 0;
+    for (JsonObjectConst o : doc["o"].as<JsonArrayConst>()) {
+        if (d.other_count >= OTHER_ACCOUNTS_MAX) break;
+        const int i = o["i"] | 0;
+        if (i < 1 || i > 9) continue;
+        OtherAccount& oa = d.others[d.other_count++];
+        oa.index = (int8_t)i;
+        oa.session_pct = o["s"] | 0.0f;
+        oa.session_reset_mins = o["sr"] | -1;
+        oa.weekly_pct = o["w"] | 0.0f;
+        oa.weekly_reset_mins = o["wr"] | -1;
+        JsonVariantConst owk = o["wk"];
+        oa.working = owk.isNull() ? -1 : (int8_t)((owk | 0) ? 1 : 0);
+        oa.turn_tokens = o["wt"] | -1;
+        oa.turn_secs = o["wd"] | -1;
+        JsonVariantConst oth = o["th"];
+        oa.thinking = oth.isNull() ? -1 : (int8_t)((oth | 0) ? 1 : 0);
+        JsonVariantConst ooff = o["off"];
+        oa.offline = ooff.isNull() ? -1 : (int8_t)((ooff | 0) ? 1 : 0);
+    }
 
     d.ok = doc["ok"] | false;
     d.valid = true;

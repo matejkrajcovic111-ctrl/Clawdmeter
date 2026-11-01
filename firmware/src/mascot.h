@@ -18,6 +18,12 @@
 
 lv_obj_t* mascot_create(lv_obj_t *parent, int slot_x, int feet_y, int cell);
 void mascot_tick(void);
+void mascot_account_changed(void);     // swiped to the other account: he's instantly doing that account's own act (call after g_account_tint is set)
+// The other (hidden) account's Clawd reacts to his own account's event: he
+// plays `anim` in his off-screen life now, and you see the rest of it if you
+// swipe over. The one on screen doesn't move.
+void mascot_hidden_act(const char* anim);
+void mascot_retint(void);              // account colour changed: redraw the seated Clawd
 
 bool mascot_seated(void);            // in his seat, between acts
 bool mascot_away(void);              // fully off screen

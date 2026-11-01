@@ -4,6 +4,8 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <TouchDrvCSTXXX.hpp>
+#include <driver/gpio.h>
+#include <soc/gpio_struct.h>
 
 static TouchDrvCST92xx touch;
 
@@ -12,8 +14,17 @@ static volatile bool     touch_pressed = false;
 static volatile uint16_t touch_x = 0;
 static volatile uint16_t touch_y = 0;
 
-static void IRAM_ATTR touch_isr(void) {
-    touch_data_ready = true;
+// No touch ISR. attachInterrupt installs the GPIO ISR service, and on the
+// dual-core S3 ESP-IDF always does that allocation inside the IPC task (1 KB
+// stack, end-of-stack watchpoint on). An interrupt nesting there (USB traffic
+// right after a flash) overflowed it: "Unhandled debug exception" boot loops.
+// The GPIO block latches the falling edge in its status register whether or
+// not a CPU interrupt is enabled, so the touch read polls and clears that bit.
+static inline bool int_edge_latched(void) {
+    const uint32_t m = 1u << TP_INT;   // TP_INT < 32: the low status register
+    if (!(GPIO.status & m)) return false;
+    GPIO.status_w1tc = m;
+    return true;
 }
 
 void touch_hal_init(void) {
@@ -26,7 +37,10 @@ void touch_hal_init(void) {
     touch.setSwapXY(true);
     touch.setMirrorXY(true, false);
     pinMode(TP_INT, INPUT_PULLUP);
-    attachInterrupt(TP_INT, touch_isr, FALLING);
+    gpio_intr_disable((gpio_num_t)TP_INT);             // never routed to a CPU
+    gpio_set_intr_type((gpio_num_t)TP_INT, GPIO_INTR_NEGEDGE);
+    GPIO.status_w1tc = 1u << TP_INT;
+    touch_data_ready = true;                           // one read now: no stale state
     Serial.println("Touch init OK");
 }
 
@@ -37,15 +51,19 @@ static void to_display_frame(uint16_t* x, uint16_t* y) {
     const uint16_t N = LCD_WIDTH - 1;   // square panel
     const uint16_t tx = *x > N ? N : *x, ty = *y > N ? N : *y;
     switch (imu_hal_rotation_quadrant()) {
-    case 1: *x = ty;     *y = N - tx; break;   // drawn (x,y) -> (N-y, x)
-    case 2: *x = N - tx; *y = N - ty; break;   // drawn (x,y) -> (N-x, N-y)
-    case 3: *x = N - ty; *y = tx;     break;   // drawn (x,y) -> (y, N-x)
-    default: break;
+    // MEASURED on hardware with corner taps (2026-10-30, quadrants 0/2/3;
+    // quadrant 1 measured earlier). The touch frame sits a quarter turn off
+    // the panel, so every quadrant is the inverse rotation plus that turn:
+    // quadrant 3 needs no change at all and quadrant 0 needs a quarter turn.
+    case 0: *x = ty;     *y = N - tx; break;
+    case 1: *x = N - tx; *y = N - ty; break;
+    case 2: *x = N - ty; *y = tx;     break;
+    default: break;   // quadrant 3: the touch frame already matches
     }
 }
 
 void touch_hal_read(uint16_t* x, uint16_t* y, bool* pressed) {
-    if (touch_data_ready) {
+    if (touch_data_ready || int_edge_latched()) {
         touch_data_ready = false;
         int16_t tx[5], ty[5];
         uint8_t n = touch.getPoint(tx, ty, touch.getSupportTouchPoint());
@@ -61,4 +79,11 @@ void touch_hal_read(uint16_t* x, uint16_t* y, bool* pressed) {
     *y = touch_y;
     to_display_frame(x, y);
     *pressed = touch_pressed;
+    // TEMP touch calibration log: raw panel point + mapped point on each press.
+    static bool was_pressed = false;
+    if (touch_pressed && !was_pressed)
+        Serial.printf("touchcal: rot=%u raw=%u,%u mapped=%u,%u\n",
+                      (unsigned)imu_hal_rotation_quadrant(), (unsigned)touch_x, (unsigned)touch_y,
+                      (unsigned)*x, (unsigned)*y);
+    was_pressed = touch_pressed;
 }

@@ -24,6 +24,7 @@
 // feet_y: the screen row his feet stand on at home (the floor he performs on).
 void performer_init(lv_obj_t *parent, int feet_y);
 void performer_tick(void);
+void performer_retint(void);           // account colour changed: repaint at the next frame
 bool performer_available(void);
 
 enum PerformerSide { PERFORMER_LEFT = -1, PERFORMER_RIGHT = +1 };

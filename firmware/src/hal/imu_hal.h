@@ -9,3 +9,8 @@
 void    imu_hal_init(void);
 void    imu_hal_tick(void);
 uint8_t imu_hal_rotation_quadrant(void);
+
+// clawdmeter2: the latest acceleration in g, panel axes (the pet's shake and
+// tilt). Optional: boards that don't implement it get the weak default in
+// hal/imu_accel_default.cpp, which returns false.
+bool    imu_hal_accel(float* x, float* y, float* z);

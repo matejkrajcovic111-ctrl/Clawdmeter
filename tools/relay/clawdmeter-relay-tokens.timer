@@ -1,0 +1,13 @@
+[Unit]
+Description=Run clawdmeter-relay tokens every 10 minutes
+
+[Timer]
+# First run two minutes after boot, then every ten minutes after the last run.
+OnBootSec=2min
+OnUnitActiveSec=10min
+# A run missed while the server was off runs at the next boot.
+Persistent=true
+Unit=clawdmeter-relay-tokens.service
+
+[Install]
+WantedBy=timers.target

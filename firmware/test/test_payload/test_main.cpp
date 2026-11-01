@@ -75,6 +75,16 @@ static void test_fast_clock_fields(void) {
     TEST_ASSERT_TRUE(d.replay);
 }
 
+static void test_machines_field(void) {
+    UsageData d;
+    TEST_ASSERT_TRUE(payload_parse("{\"n\":5,\"sm\":\"pc 2 proxmox 3\"}", &d, nullptr));
+    TEST_ASSERT_EQUAL_STRING("pc 2 proxmox 3", d.machines);
+    TEST_ASSERT_TRUE(payload_parse("{\"n\":5}", &d, nullptr));
+    TEST_ASSERT_EQUAL_STRING("", d.machines);
+    TEST_ASSERT_TRUE(payload_parse("{\"sm\":\"0123456789012345678901234567890123456789\"}", &d, nullptr));
+    TEST_ASSERT_EQUAL_UINT(31, strlen(d.machines));
+}
+
 static void test_fast_clock_clamps(void) {
     UsageData d;
     TEST_ASSERT_TRUE(payload_parse("{\"a\":9,\"n\":-4,\"es\":0}", &d, nullptr));
@@ -121,6 +131,39 @@ static void test_pace_marker(void) {
     TEST_ASSERT_EQUAL_INT(1, d.pace_marker);
 }
 
+static void test_thinking_flag(void) {
+    UsageData d;
+    TEST_ASSERT_TRUE(payload_parse("{\"ok\":true}", &d, nullptr));
+    TEST_ASSERT_EQUAL_INT(-1, d.thinking);          // absent: not said
+    TEST_ASSERT_TRUE(payload_parse("{\"wk\":1,\"th\":1,\"o\":[{\"i\":2,\"wk\":1,\"th\":0}]}", &d, nullptr));
+    TEST_ASSERT_EQUAL_INT(1, d.thinking);
+    TEST_ASSERT_EQUAL_INT(1, d.other_count);
+    TEST_ASSERT_EQUAL_INT(0, d.others[0].thinking);
+    TEST_ASSERT_TRUE(payload_parse("{\"o\":[{\"i\":2}]}", &d, nullptr));
+    TEST_ASSERT_EQUAL_INT(-1, d.others[0].thinking);
+}
+
+static void test_offline_flag(void) {
+    UsageData d;
+    TEST_ASSERT_TRUE(payload_parse("{\"o\":[{\"i\":2,\"off\":1}]}", &d, nullptr));
+    TEST_ASSERT_EQUAL_INT(1, d.other_count);
+    TEST_ASSERT_EQUAL_INT(1, d.others[0].offline);
+    TEST_ASSERT_TRUE(payload_parse("{\"o\":[{\"i\":2}]}", &d, nullptr));
+    TEST_ASSERT_EQUAL_INT(-1, d.others[0].offline);   // absent: not said
+}
+
+static void test_all_logged_out_payload(void) {
+    UsageData d;
+    TEST_ASSERT_TRUE(payload_parse(
+        "{\"ok\":false,\"ac\":2,\"o\":[{\"i\":1,\"off\":1},{\"i\":2,\"off\":1}]}", &d, nullptr));
+    TEST_ASSERT_FALSE(d.ok);
+    TEST_ASSERT_EQUAL_INT(2, d.account_count);
+    TEST_ASSERT_EQUAL_INT(-1, d.account_idx);
+    TEST_ASSERT_EQUAL_INT(2, d.other_count);
+    TEST_ASSERT_EQUAL_INT(1, d.others[0].offline);
+    TEST_ASSERT_EQUAL_INT(1, d.others[1].offline);
+}
+
 static void test_long_strings_truncate(void) {
     UsageData d;
     TEST_ASSERT_TRUE(payload_parse("{\"st\":\"abcdefghijklmnopqrstuvwxyz\"}", &d, nullptr));
@@ -130,6 +173,7 @@ static void test_long_strings_truncate(void) {
 int main(void) {
     UNITY_BEGIN();
     RUN_TEST(test_rejects_malformed_json);
+    RUN_TEST(test_machines_field);
     RUN_TEST(test_empty_object_gives_legacy_defaults);
     RUN_TEST(test_legacy_fields);
     RUN_TEST(test_fast_clock_fields);
@@ -137,6 +181,9 @@ int main(void) {
     RUN_TEST(test_liveliness);
     RUN_TEST(test_attention_animation);
     RUN_TEST(test_pace_marker);
+    RUN_TEST(test_thinking_flag);
+    RUN_TEST(test_offline_flag);
+    RUN_TEST(test_all_logged_out_payload);
     RUN_TEST(test_long_strings_truncate);
     return UNITY_END();
 }

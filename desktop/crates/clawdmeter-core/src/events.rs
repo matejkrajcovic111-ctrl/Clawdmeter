@@ -255,7 +255,16 @@ pub enum EventCode {
     Stop,
     /// `b`: a prompt after 10+ quiet minutes ("you're back").
     Back,
+    /// clawdmeter2 `t`: a test run passed (the hook's `TestPass` line).
+    TestPass,
+    /// clawdmeter2 `f`: a test run failed (`TestFail`).
+    TestFail,
 }
+
+/// clawdmeter2: the events.log names the hook writes after a test run.
+pub const TEST_PASS_EVENT: &str = "TestPass";
+/// See [`TEST_PASS_EVENT`].
+pub const TEST_FAIL_EVENT: &str = "TestFail";
 
 impl EventCode {
     /// The one-letter payload value.
@@ -264,6 +273,8 @@ impl EventCode {
             EventCode::Prompt => "p",
             EventCode::Stop => "s",
             EventCode::Back => "b",
+            EventCode::TestPass => "t",
+            EventCode::TestFail => "f",
         }
     }
 }
@@ -283,6 +294,38 @@ pub fn activity_level(tool_calls_last_minute: usize) -> u8 {
         4..=9 => 2,
         _ => 3,
     }
+}
+
+/// Label for sessions without a machine prefix.
+const LOCAL_MACHINE: &str = "pc";
+/// Longest `sm` string, in bytes.
+pub const MACHINES_LINE_MAX: usize = 28;
+
+/// `sm`: "pc 2 \· proxmox 3". `None` when there is nothing beyond the local
+/// machine. Names are lowercased and cut to 8 chars; entries that do not fit
+/// in [`MACHINES_LINE_MAX`] bytes are dropped from the end and counted as "+N".
+pub fn machines_line(by_machine: &[(String, u32)]) -> Option<String> {
+    if by_machine.iter().all(|(m, _)| m == LOCAL_MACHINE) {
+        return None;
+    }
+    let parts: Vec<(String, u32)> = by_machine
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(m, n)| (m.to_lowercase().chars().take(8).collect(), *n))
+        .collect();
+    let join = |k: usize| parts[..k].iter().map(|(m, n)| format!("{m} {n}")).collect::<Vec<_>>().join(" \u{b7} ");
+    let all = join(parts.len());
+    if all.len() <= MACHINES_LINE_MAX {
+        return Some(all);
+    }
+    for k in (0..parts.len()).rev() {
+        let dropped: u32 = parts[k..].iter().map(|(_, n)| n).sum();
+        let line = if k == 0 { format!("+{dropped}") } else { format!("{} +{dropped}", join(k)) };
+        if line.len() <= MACHINES_LINE_MAX {
+            return Some(line);
+        }
+    }
+    None
 }
 
 /// State derived from hook events.
@@ -364,6 +407,10 @@ impl Activity {
                 Signal::Stop
             }
             HookKind::PostToolUse => Signal::Tool,
+            HookKind::Other(ref name) if name == TEST_PASS_EVENT || name == TEST_FAIL_EVENT => {
+                self.bump(if name == TEST_PASS_EVENT { EventCode::TestPass } else { EventCode::TestFail });
+                Signal::Other
+            }
             _ => Signal::Other,
         }
     }
@@ -389,6 +436,29 @@ impl Activity {
     /// `n`: sessions with any hook event in the last 5 minutes.
     pub fn sessions_active(&self, now: i64) -> u32 {
         self.sessions.values().filter(|t| now - **t < SESSION_ACTIVE_SECS).count() as u32
+    }
+
+    /// Active sessions per machine: local ("pc") first, then the others by
+    /// name. A session id `<machine>.<sid>` (from the relay) belongs to
+    /// `<machine>`; an id without a '.' (a plain UUID) is local.
+    pub fn sessions_by_machine(&self, now: i64) -> Vec<(String, u32)> {
+        let mut by: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        for (sid, t) in &self.sessions {
+            if now - *t >= SESSION_ACTIVE_SECS {
+                continue;
+            }
+            let machine = match sid.split_once('.') {
+                Some((m, _)) if !m.is_empty() => m.to_lowercase(),
+                _ => LOCAL_MACHINE.to_owned(),
+            };
+            *by.entry(machine).or_insert(0) += 1;
+        }
+        let mut out = Vec::with_capacity(by.len());
+        if let Some(n) = by.remove(LOCAL_MACHINE) {
+            out.push((LOCAL_MACHINE.to_owned(), n));
+        }
+        out.extend(by);
+        out
     }
 
     /// A prompt is in flight (no Stop after it) and something happened in the
@@ -449,6 +519,37 @@ mod tests {
         assert_eq!(activity_level(4), 2);
         assert_eq!(activity_level(9), 2);
         assert_eq!(activity_level(10), 3);
+    }
+
+    #[test]
+    fn machines_split_and_line() {
+        let mut a = Activity::default();
+        let t = 1_000_000;
+        let uuid = "3f2b8c1e-aaaa-bbbb-cccc-123456789abc";
+        a.ingest(&ev(t, "PostToolUse", uuid));
+        a.ingest(&ev(t, "PostToolUse", "local2"));
+        a.ingest(&ev(t, "PostToolUse", "Proxmox.s1"));
+        a.ingest(&ev(t, "PostToolUse", "Proxmox.s2"));
+        a.ingest(&ev(t, "PostToolUse", "alpha.s1"));
+        let by = a.sessions_by_machine(t + 1);
+        assert_eq!(by, vec![("pc".to_owned(), 2), ("alpha".to_owned(), 1), ("proxmox".to_owned(), 2)]);
+        assert_eq!(machines_line(&by).as_deref(), Some("pc 2 \u{b7} alpha 1 \u{b7} proxmox 2"));
+        assert!(a.sessions_by_machine(t + 400).is_empty());
+    }
+
+    fn mv(v: &[(&str, u32)]) -> Vec<(String, u32)> {
+        v.iter().map(|(m, n)| (m.to_string(), *n)).collect()
+    }
+
+    #[test]
+    fn machines_line_cases() {
+        assert_eq!(machines_line(&[]), None);
+        assert_eq!(machines_line(&mv(&[("pc", 3)])), None);
+        assert_eq!(machines_line(&mv(&[("pc", 2), ("proxmox", 3)])).as_deref(), Some("pc 2 \u{b7} proxmox 3"));
+        assert_eq!(machines_line(&mv(&[("Verylongmachinename", 1)])).as_deref(), Some("verylong 1"));
+        let l = machines_line(&mv(&[("pc", 2), ("aaaaaaaa", 3), ("bbbbbbbb", 4), ("cccccccc", 5)])).unwrap();
+        assert_eq!(l, "pc 2 \u{b7} aaaaaaaa 3 +9");
+        assert!(l.len() <= MACHINES_LINE_MAX);
     }
 
     #[test]

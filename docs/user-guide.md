@@ -4,6 +4,11 @@ You need a supported board, a USB data cable, Bluetooth, and Claude Code
 installed and signed in to an account that reports usage limits.
 See the [supported boards](../README.md#supported-boards).
 
+This fork adds several accounts, swipe and pet mode, a second computer on the
+same board, and a relay for Claude Code running on other machines. See
+[What's different in this fork](clawdmeter2.md) for a tour and the settings,
+and [relay setup](relay-setup.md) for the relay.
+
 ## Installation
 
 Download the installer for your OS from the [latest release](https://github.com/HermannBjorgvin/Clawdmeter/releases/latest).
@@ -80,8 +85,10 @@ keyboard because its buttons send key presses.
 
 For normal operation, the app looks for an OS-known Clawdmeter rather than
 connecting to arbitrary nearby devices. On boards with a software-controlled
-PWR button, hold it for about 3 seconds, then release to clear the device's
-Bluetooth bonds. The LCD-4's PWR key resets the board; it does not clear pairing.
+PWR button, hold it for about 3 seconds, then release: the device lets one
+more computer pair for 3 minutes and keeps the ones already paired (up to 3).
+Hold and release again while that window is open to clear all its Bluetooth
+bonds. The LCD-4's PWR key resets the board; it does not clear pairing.
 
 ## Hooks and privacy
 
@@ -168,7 +175,7 @@ and character rules.
 | --- | --- |
 | BOOT | Hold to send Space to the focused window, for Claude Code voice input. GPIO 0 on S3; GPIO 9 on C6. |
 | Secondary, where fitted | Send Shift+Tab to the focused window. S3 2.16: GPIO 18; C6 2.16: GPIO 10; LCD-1.54: GPIO 5. |
-| PWR, where software-controlled | Short press: brightness. Hold about 3 seconds and release: clear pairing. |
+| PWR, where software-controlled | Short press: brightness. Hold about 3 seconds and release: pair another computer (3 minutes); do it again while open: clear pairing. |
 
 The LCD-4 has one user button, BOOT. Its PWR key is a hardware reset.
 

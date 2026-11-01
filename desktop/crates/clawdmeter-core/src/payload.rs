@@ -74,6 +74,10 @@ pub struct Payload {
     /// Sessions with a hook event in the last 5 minutes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub n: Option<u32>,
+    /// Sessions per machine, e.g. "pc 2 \· proxmox 3"; sent only when a
+    /// session runs on another machine. Dropped first when the write is too big.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sm: Option<String>,
     /// 1 = the usage numbers are a replay, not a fresh poll (heartbeats and
     /// writes between polls): the rate math ignores them. Fast-clock fields in
     /// the same write still count.
@@ -92,15 +96,100 @@ pub struct Payload {
     /// value it got.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pm: Option<u8>,
+    /// clawdmeter2: the 1-based account (in `config_dirs` order) the usage
+    /// fields belong to. Sent only with two or more accounts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai: Option<u8>,
+    /// clawdmeter2: how many accounts are configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ac: Option<u8>,
+    /// clawdmeter2: 1 while Claude is working in the account the usage fields
+    /// belong to, 0 when not (the device's recording light). Sent once hooks
+    /// have been seen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wk: Option<u8>,
+    /// clawdmeter2: 1 while Claude is thinking (only ever with `wk` = 1), 0
+    /// when working but not thinking. Sent with `wk`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub th: Option<u8>,
+    /// clawdmeter2: output tokens of that account's current (or last)
+    /// prompt, as Claude Code's spinner counts them. Sent once hooks are seen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wt: Option<u32>,
+    /// clawdmeter2: seconds since that account's latest prompt (the
+    /// device's "working for" timer). Sent once hooks are seen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wd: Option<u32>,
+    /// clawdmeter2: the tool Claude is running in that account right now, as
+    /// a short code (`toolinfo::tool_code`); omitted when none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tl: Option<String>,
+    /// clawdmeter2: the other accounts' last readings, for the device's swipe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub o: Option<Vec<OtherAccount>>,
+}
+
+/// Another account's numbers in `o` (Pro/Max fields; a spend-capped account
+/// sends its spend % as `s`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct OtherAccount {
+    /// 1-based account number.
+    pub i: u8,
+    /// Session % used (spend % for a spend-capped account).
+    pub s: u32,
+    /// Minutes until the session resets; -1 = not started / unknown.
+    pub sr: i64,
+    /// Weekly % used; -1 = unknown (no data is never sent as a zero).
+    pub w: i32,
+    /// Minutes until the weekly reset; -1 = unknown.
+    pub wr: i64,
+    /// 1 while Claude is working in this account, 0 when not (like `wk`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wk: Option<u8>,
+    /// Thinking flag of this account, like `th`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub th: Option<u8>,
+    /// Tokens of its current prompt, like `wt`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wt: Option<u32>,
+    /// Seconds since its latest prompt, like `wd`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wd: Option<u32>,
+    /// 1 = nobody is logged into this account; the numbers are its last reading.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub off: Option<u8>,
+}
+
+impl OtherAccount {
+    /// The `o` entry for account `i`'s reading, as of `now`.
+    pub fn from_reading(i: u8, r: &UsageReading, now: DateTime<Utc>) -> Self {
+        let p = Payload::from_reading_in(r, now, &Utc);
+        OtherAccount {
+            i,
+            s: p.s.unwrap_or(0),
+            sr: if r.is_spend_only() { -1 } else { p.sr.unwrap_or(-1) },
+            // `Payload` shows a missing week as 0; here it is unknown.
+            w: match (&r.week, r.is_spend_only()) {
+                (Some(win), false) => i32::try_from(win.pct).unwrap_or(i32::MAX),
+                _ => -1,
+            },
+            wr: if r.is_spend_only() || r.week.is_none() { -1 } else { p.wr.unwrap_or(-1) },
+            wk: None,
+            th: None,
+            wt: None,
+            wd: None,
+            off: None,
+        }
+    }
 }
 
 /// Every key [`Payload`] can emit, in serialization order.
 pub const PAYLOAD_KEYS: &[&str] = &[
     "s", "sr", "w", "wr", "st", "acct", "tp", "pd", "rd", "t", "tf", "c", "ok", "b", "m", "x", "a", "e", "es", "n",
-    "rp", "lv", "aa", "pm",
+    "sm", "rp", "lv", "aa", "pm", "ai", "ac", "wk", "th", "wt", "wd", "tl", "o",
 ];
 /// The fast-clock keys added in v0.4 (old firmware ignores them).
-pub const ADDITIVE_KEYS: &[&str] = &["a", "e", "es", "n", "rp"];
+pub const ADDITIVE_KEYS: &[&str] = &["a", "e", "es", "n", "sm", "rp"];
 
 fn minutes_until(at: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
     // Round like the bash daemon's sprintf("%.0f"), clamp at 0.
@@ -284,11 +373,39 @@ impl Payload {
         serde_json::to_string(self).expect("payload serializes")
     }
 
-    /// JSON for one write of at most `limit` bytes: shorten the alert message,
-    /// then drop it, until it fits (Python daemon's `encode_payload`).
+    /// JSON for one write of at most `limit` bytes. Least valuable first
+    /// until it fits: the alert's short message `sm`, the other accounts
+    /// `o` entries' `wt`/`wd`/`th`/`wk`, then the `o` entries that are not
+    /// offline (they come back on the next write), then the alert message
+    /// `m` is shortened, and dropped if that isn't enough. Offline entries
+    /// (`off` = 1) are never dropped.
     pub fn encode(&self, limit: usize) -> Vec<u8> {
         let mut data = self.to_json().into_bytes();
         let mut p = self.clone();
+        if data.len() > limit && p.sm.is_some() {
+            p.sm = None;
+            data = p.to_json().into_bytes();
+        }
+        if data.len() > limit && p.o.is_some() {
+            type Field = fn(&mut OtherAccount);
+            let fields: [Field; 4] = [|a| a.wt = None, |a| a.wd = None, |a| a.th = None, |a| a.wk = None];
+            for clear in fields {
+                if data.len() <= limit {
+                    break;
+                }
+                p.o.iter_mut().flatten().for_each(clear);
+                data = p.to_json().into_bytes();
+            }
+            if data.len() > limit {
+                if let Some(o) = &mut p.o {
+                    o.retain(|a| a.off == Some(1));
+                    if o.is_empty() {
+                        p.o = None;
+                    }
+                }
+                data = p.to_json().into_bytes();
+            }
+        }
         let mut msg = p.m.clone().unwrap_or_default();
         while data.len() > limit && !msg.is_empty() {
             let over = data.len() - limit;
@@ -482,6 +599,56 @@ mod tests {
     }
 
     #[test]
+    fn encode_drops_sm_first() {
+        let base = Payload { s: Some(4), ok: true, m: Some("hello".into()), ..Default::default() };
+        let with = Payload { sm: Some("pc 2 \u{b7} proxmox 3".into()), ..base.clone() };
+        let full = with.encode(500);
+        assert!(String::from_utf8(full).unwrap().contains("\"sm\""));
+        let tight = with.encode(base.to_json().len());
+        let v: serde_json::Value = serde_json::from_slice(&tight).unwrap();
+        assert!(v.get("sm").is_none());
+        assert_eq!(v["m"], "hello");
+    }
+
+    #[test]
+    fn encode_drops_o_before_shrinking_m() {
+        let base =
+            Payload { s: Some(4), ok: true, m: Some("needs you in the other terminal".into()), ..Default::default() };
+        let with = Payload {
+            o: Some(vec![OtherAccount {
+                i: 2,
+                s: 9,
+                sr: 10,
+                w: 11,
+                wr: 12,
+                wk: None,
+                th: None,
+                wt: None,
+                wd: None,
+                off: None,
+            }]),
+            sm: Some("pc 2".into()),
+            ..base.clone()
+        };
+        let tight = with.encode(base.to_json().len());
+        let v: serde_json::Value = serde_json::from_slice(&tight).unwrap();
+        assert!(v.get("sm").is_none() && v.get("o").is_none());
+        assert_eq!(v["m"], "needs you in the other terminal", "the message survives intact");
+    }
+
+    #[test]
+    fn unknown_weekly_is_minus_one_not_zero() {
+        let now = at("2026-10-13T12:00:00Z");
+        let r = UsageReading {
+            session: Some(Window { pct: 20, resets_at: Some(now + chrono::Duration::minutes(60)) }),
+            ..Default::default()
+        };
+        let o = OtherAccount::from_reading(2, &r, now);
+        assert_eq!((o.s, o.sr, o.w, o.wr), (20, 60, -1, -1));
+        assert!(serde_json::to_string(&o).unwrap().contains("\"w\":-1"));
+    }
+
+    #[test]
     fn full_payload_key_order() {
         let pl = Payload {
             s: Some(1),
@@ -504,10 +671,30 @@ mod tests {
             e: Some("p".into()),
             es: Some(7),
             n: Some(1),
+            sm: Some("pc 1 \u{b7} x 2".into()),
             rp: Some(1),
             lv: Some(3),
             aa: Some(120),
             pm: Some(1),
+            ai: Some(1),
+            ac: Some(2),
+            wk: Some(1),
+            th: Some(1),
+            wt: Some(1234),
+            wd: Some(65),
+            tl: Some("sh".into()),
+            o: Some(vec![OtherAccount {
+                i: 2,
+                s: 9,
+                sr: 10,
+                w: 11,
+                wr: 12,
+                wk: Some(0),
+                th: Some(0),
+                wt: Some(5),
+                wd: Some(9),
+                off: None,
+            }]),
         };
         let v: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&pl.to_json()).unwrap();
         // serde_json's Map is sorted without preserve_order; check membership.
@@ -515,7 +702,12 @@ mod tests {
         let want: BTreeSet<&str> = PAYLOAD_KEYS.iter().copied().collect();
         assert_eq!(got, want);
         let json = pl.to_json();
-        let positions: Vec<usize> = PAYLOAD_KEYS.iter().map(|k| json.find(&format!("\"{k}\":")).unwrap()).collect();
+        // Top-level keys only: `o` is last, and its entries reuse "s", "sr", ...
+        let top = &json[..json.find("\"o\":").unwrap()];
+        let positions: Vec<usize> = PAYLOAD_KEYS
+            .iter()
+            .map(|k| if *k == "o" { top.len() } else { top.find(&format!("\"{k}\":")).unwrap() })
+            .collect();
         assert!(positions.windows(2).all(|w| w[0] < w[1]), "keys serialize in PAYLOAD_KEYS order");
     }
 
@@ -533,7 +725,8 @@ mod tests {
         let mut fw = BTreeSet::new();
         for entry in rd.flatten() {
             let path = entry.path();
-            if path.extension().is_none_or(|e| e != "cpp") {
+            // history.cpp parses the separate history message (history.rs).
+            if path.extension().is_none_or(|e| e != "cpp") || path.file_name().is_some_and(|n| n == "history.cpp") {
                 continue;
             }
             let src = std::fs::read_to_string(&path).unwrap_or_default();
@@ -554,5 +747,57 @@ mod tests {
                 "payload sends {k:?}, which the firmware doesn't read"
             );
         }
+    }
+
+    #[test]
+    fn th_follows_wk_at_top_level_and_in_o() {
+        let pl = Payload {
+            ok: true,
+            wk: Some(1),
+            th: Some(1),
+            wt: Some(3),
+            o: Some(vec![OtherAccount { i: 2, wk: Some(1), th: Some(0), wt: Some(4), ..Default::default() }]),
+            ..Default::default()
+        };
+        let j = pl.to_json();
+        assert!(j.contains(r#""wk":1,"th":1,"wt":3"#), "{j}");
+        assert!(j.contains(r#""wk":1,"th":0,"wt":4"#), "{j}");
+        let bare = Payload { ok: true, wk: Some(0), th: Some(0), ..Default::default() };
+        assert!(bare.to_json().contains(r#""wk":0,"th":0"#));
+        assert!(!Payload { ok: true, ..Default::default() }.to_json().contains("\"th\""));
+    }
+
+    #[test]
+    fn off_serializes_in_o() {
+        let pl = Payload {
+            ok: true,
+            o: Some(vec![
+                OtherAccount { i: 2, wd: Some(5), off: Some(1), ..Default::default() },
+                OtherAccount { i: 3, ..Default::default() },
+            ]),
+            ..Default::default()
+        };
+        let j = pl.to_json();
+        assert!(j.contains(r#""wd":5,"off":1"#), "{j}");
+        assert_eq!(j.matches("\"off\"").count(), 1, "{j}");
+    }
+
+    #[test]
+    fn encode_keeps_offline_o() {
+        let pl = Payload {
+            ok: true,
+            m: Some("x".repeat(60)),
+            o: Some(vec![
+                OtherAccount { i: 2, s: 9, wk: Some(1), th: Some(0), wt: Some(4), wd: Some(7), ..Default::default() },
+                OtherAccount { i: 3, s: 5, off: Some(1), ..Default::default() },
+            ]),
+            ..Default::default()
+        };
+        let bytes = pl.encode(60);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let o = v["o"].as_array().expect("o survives");
+        assert_eq!(o.len(), 1, "only the offline entry is left");
+        assert_eq!(o[0]["i"], 3);
+        assert_eq!(o[0]["off"], 1);
     }
 }

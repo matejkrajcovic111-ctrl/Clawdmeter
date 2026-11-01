@@ -489,6 +489,14 @@ pub enum DeviceEvent {
     /// TX `{"dismiss":true}`: the alert ended on the device (a tap, or its
     /// own timeout).
     Dismissed,
+    /// clawdmeter2 TX `{"perm":N,"allow":true|false}`: a permission request
+    /// answered on the device.
+    Permission {
+        /// The request id.
+        id: u32,
+        /// Allow (else deny).
+        allow: bool,
+    },
 }
 
 /// The device's events, in order.
@@ -504,6 +512,13 @@ pub fn device_event(uuid: Uuid, value: &[u8]) -> Option<DeviceEvent> {
         return None;
     }
     let text: String = std::str::from_utf8(value).ok()?.chars().filter(|c| !c.is_whitespace()).collect();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+        if let (Some(id), Some(allow)) =
+            (v.get("perm").and_then(|x| x.as_u64()), v.get("allow").and_then(|x| x.as_bool()))
+        {
+            return Some(DeviceEvent::Permission { id: id as u32, allow });
+        }
+    }
     text.contains("\"dismiss\":true").then_some(DeviceEvent::Dismissed)
 }
 
@@ -692,6 +707,15 @@ async fn bonded_by_address(adapter: &Adapter, cached: Option<&str>) -> Vec<Candi
         if out.iter().any(|c| c.key.eq_ignore_ascii_case(&addr.to_string())) {
             continue;
         }
+        // clawdmeter2: only once it is advertising. A connect to a bonded
+        // device that is off (rebooting, flashing, flat) times out, and after
+        // that Windows never connects to it again until it is re-paired
+        // (reproduced: the board offline ~50 s with this loop running broke
+        // it; with the app closed it reconnected in 5 s).
+        if !advertising_now(adapter, &PeripheralId::from(addr), ADVERT_WAIT).await {
+            log::info!("bonded {addr} is not advertising; waiting for it");
+            continue;
+        }
         if let Ok(p) = adapter.add_peripheral(&PeripheralId::from(addr)).await {
             log::info!("trying bonded address {addr}");
             out.push(Candidate {
@@ -703,6 +727,58 @@ async fn bonded_by_address(adapter: &Adapter, cached: Option<&str>) -> Vec<Candi
         }
     }
     out
+}
+
+/// clawdmeter2: is `key` (a MAC) the device paired in Windows? A look-alike
+/// that only copies the name / service is not, and a copied MAC fails the
+/// bond's encryption, so only the real device passes. Blocking (PowerShell).
+/// Always false off Windows (permission answers stay off there).
+pub fn os_paired(key: &str) -> bool {
+    #[cfg(windows)]
+    {
+        windows_pnp_address().is_some_and(|mac| mac.eq_ignore_ascii_case(key))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = key;
+        false
+    }
+}
+
+/// How long to listen for the bonded device's advertising before connecting.
+#[cfg(windows)]
+const ADVERT_WAIT: Duration = Duration::from_secs(4);
+
+/// Did `id` advertise within `wait`? A short scan of our own.
+#[cfg(windows)]
+async fn advertising_now(adapter: &Adapter, id: &btleplug::platform::PeripheralId, wait: Duration) -> bool {
+    use btleplug::api::CentralEvent;
+    let Ok(mut events) = adapter.events().await else { return true }; // can't tell: try as before
+    if adapter.start_scan(ScanFilter::default()).await.is_err() {
+        return true;
+    }
+    let seen = tokio::time::timeout(wait, async {
+        while let Some(ev) = events.next().await {
+            let hit = match &ev {
+                CentralEvent::DeviceDiscovered(p)
+                | CentralEvent::DeviceUpdated(p)
+                | CentralEvent::DeviceConnected(p) => p == id,
+                CentralEvent::RssiUpdate { id: p, .. }
+                | CentralEvent::ManufacturerDataAdvertisement { id: p, .. }
+                | CentralEvent::ServiceDataAdvertisement { id: p, .. }
+                | CentralEvent::ServicesAdvertisement { id: p, .. } => p == id,
+                _ => false,
+            };
+            if hit {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    let _ = adapter.stop_scan().await;
+    seen
 }
 
 /// The bonded Clawdmeter's MAC from the Windows PnP table (the Windows
@@ -996,7 +1072,8 @@ mod tests {
     #[test]
     fn acceptance_rules() {
         assert!(accept(None, true));
-        assert!(accept(Some("Clawdmeter"), false));
+        assert!(accept(Some(DEVICE_NAME), false));
+        assert!(!accept(Some("Clawdmeter"), false));
         assert!(!accept(Some("Keychron K2"), false));
         assert!(!accept(Some("clawdmeter"), false));
         assert!(!accept(None, false));

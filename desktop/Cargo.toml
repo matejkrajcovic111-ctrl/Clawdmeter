@@ -6,6 +6,7 @@ members = [
     "crates/clawdmeter-ble",
     "crates/clawdmeter-flash",
     "crates/clawdmeter-app",
+    "crates/clawdmeter-relay",
 ]
 
 [workspace.package]
@@ -19,6 +20,7 @@ repository = "https://github.com/HermannBjorgvin/Clawdmeter"
 clawdmeter-core = { path = "crates/clawdmeter-core" }
 clawdmeter-ble = { path = "crates/clawdmeter-ble" }
 clawdmeter-flash = { path = "crates/clawdmeter-flash" }
+clawdmeter-relay = { path = "crates/clawdmeter-relay" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

@@ -9,6 +9,13 @@
 //!   manual setup and the previous installer). These are migrated in place.
 //!
 //! Everything else is left exactly as it is.
+//!
+//! The installer also sets each account's `statusLine` to
+//! `<exe> statusline` (live usage for the app). A status line that was there
+//! and isn't ours is handed back to the caller ([`merge_with`]) to be saved as
+//! `statusline_command` in the app config, which `clawdmeter statusline` runs
+//! and prints, so the old one keeps showing. Removing the hooks puts the saved
+//! command back.
 
 use std::fs;
 use std::io;
@@ -30,13 +37,15 @@ pub struct HookSpec {
     pub args: &'static str,
 }
 
-/// The five hooks: the attention card's four plus Stop, all logging events.
-pub const HOOKS: [HookSpec; 5] = [
+/// The hooks: the attention card's four plus Stop, all logging events, and
+/// clawdmeter2's PermissionRequest (answered on the device).
+pub const HOOKS: [HookSpec; 6] = [
     HookSpec { event: "UserPromptSubmit", matcher: None, args: "clear event" },
     HookSpec { event: "PostToolUse", matcher: None, args: "clear event" },
     HookSpec { event: "Stop", matcher: None, args: "event" },
     HookSpec { event: "Notification", matcher: None, args: "alert event" },
     HookSpec { event: "PreToolUse", matcher: Some("AskUserQuestion"), args: "alert event" },
+    HookSpec { event: "PermissionRequest", matcher: None, args: "permission" },
 ];
 
 /// The binary hooks should run: the path that outlives this process (an
@@ -51,6 +60,11 @@ pub fn hook_binary(state_dir: &Path) -> io::Result<PathBuf> {
 /// single-quoted when they hold anything a shell would interpret.
 pub fn hook_command(exe: &Path, args: &str) -> String {
     format!("{} hook {args}", quote_exe(exe))
+}
+
+/// The `statusLine` command: `<exe> statusline`, quoted like the hooks.
+pub fn statusline_command(exe: &Path) -> String {
+    format!("{} statusline", quote_exe(exe))
 }
 
 fn quote_exe(exe: &Path) -> String {
@@ -145,7 +159,7 @@ pub fn owner(cmd: &str) -> Owner {
         return Owner::Foreign;
     }
     let args: Vec<&str> = words.collect();
-    if !matches!(args.first(), Some(&"alert" | &"clear" | &"event")) {
+    if !matches!(args.first(), Some(&"alert" | &"clear" | &"event" | &"permission")) {
         return Owner::Foreign;
     }
     if !basename(&exe).starts_with("clawdmeter") {
@@ -165,6 +179,92 @@ fn group_matcher(group: &Value) -> Option<&str> {
 
 fn is_managed(hook: &Value) -> bool {
     command_of(hook).is_some_and(|c| owner(c) != Owner::Foreign)
+}
+
+/// What a settings.json `statusLine` is, as far as we're concerned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusLine {
+    /// No `statusLine`.
+    Missing,
+    /// `<clawdmeter binary> statusline`.
+    Ours(String),
+    /// Someone else's command.
+    Foreign(String),
+    /// Present, but not a command we can carry over: left alone.
+    Opaque,
+}
+
+/// Classify a `statusLine` command.
+pub fn statusline_owner(cmd: &str) -> StatusLine {
+    match first_word(cmd) {
+        Some((exe, rest)) if rest.trim() == "statusline" && basename(&exe).starts_with("clawdmeter") => {
+            StatusLine::Ours(exe)
+        }
+        _ => StatusLine::Foreign(cmd.to_owned()),
+    }
+}
+
+fn statusline_of(root: &Map<String, Value>) -> StatusLine {
+    match root.get("statusLine") {
+        None | Some(Value::Null) => StatusLine::Missing,
+        Some(v) => match command_of(v) {
+            Some(c) if !c.trim().is_empty() => statusline_owner(c),
+            _ => StatusLine::Opaque,
+        },
+    }
+}
+
+/// What [`merge_statusline`] did with a foreign `statusLine`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kept {
+    /// There was none of the user's (or it is unreadable and was left alone).
+    Nothing,
+    /// The user's command was replaced; save it as `statusline_command`.
+    Replaced(String),
+    /// The user's command differs from `other`, the one already being kept
+    /// (only one can be passed through), so it was left as it is.
+    Skipped(String),
+}
+
+/// Point `statusLine` at `exe`. `other` is the foreign command already being
+/// kept for another account: a different one here is not replaced.
+fn merge_statusline(root: &mut Map<String, Value>, exe: &Path, other: Option<&str>) -> Kept {
+    let want = statusline_command(exe);
+    let kept = match statusline_of(root) {
+        StatusLine::Opaque => return Kept::Nothing,
+        StatusLine::Foreign(c) if other.is_some_and(|o| o != c) => return Kept::Skipped(c),
+        StatusLine::Foreign(c) => Kept::Replaced(c),
+        _ => Kept::Nothing,
+    };
+    match root.get_mut("statusLine").and_then(Value::as_object_mut) {
+        // Keep other keys (e.g. `padding`).
+        Some(o) => {
+            o.insert("type".into(), Value::String("command".into()));
+            o.insert("command".into(), Value::String(want));
+        }
+        None => {
+            root.insert("statusLine".into(), json!({ "type": "command", "command": want }));
+        }
+    }
+    kept
+}
+
+/// Take our `statusLine` out: back to `restore` (the command saved in the
+/// config), or gone.
+fn remove_statusline(root: &mut Map<String, Value>, restore: Option<&str>) {
+    if !matches!(statusline_of(root), StatusLine::Ours(_)) {
+        return;
+    }
+    match restore.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(c) => {
+            if let Some(o) = root.get_mut("statusLine").and_then(Value::as_object_mut) {
+                o.insert("command".into(), Value::String(c.to_owned()));
+            }
+        }
+        None => {
+            root.remove("statusLine");
+        }
+    }
 }
 
 /// settings.json problems.
@@ -218,6 +318,18 @@ fn render(root: Map<String, Value>) -> String {
 /// at `exe`. Legacy and stale entries are rewritten in place; duplicates of
 /// ours are dropped; foreign hooks are untouched.
 pub fn merge(text: Option<&str>, exe: &Path) -> Result<String, HookError> {
+    merge_with(text, exe).map(|(out, _)| out)
+}
+
+/// [`merge`], also returning the foreign `statusLine` command it replaced
+/// (to be saved as `statusline_command`).
+pub fn merge_with(text: Option<&str>, exe: &Path) -> Result<(String, Option<String>), HookError> {
+    merge_keeping(text, exe, None).map(|(out, kept)| (out, if let Kept::Replaced(c) = kept { Some(c) } else { None }))
+}
+
+/// [`merge_with`] for one of several accounts: `other` is the foreign status
+/// line command an earlier account already gave up (see [`Kept::Skipped`]).
+pub fn merge_keeping(text: Option<&str>, exe: &Path, other: Option<&str>) -> Result<(String, Kept), HookError> {
     let mut root = parse_root(text)?;
     let hooks = root.entry("hooks").or_insert_with(|| Value::Object(Map::new()));
     let hooks = hooks.as_object_mut().ok_or(HookError::Shape("\"hooks\" isn't an object"))?;
@@ -279,7 +391,8 @@ pub fn merge(text: Option<&str>, exe: &Path) -> Result<String, HookError> {
     }
     // Legacy entries on events we no longer use.
     strip_managed(hooks, |event| !HOOKS.iter().any(|s| s.event == event));
-    Ok(render(root))
+    let kept = merge_statusline(&mut root, exe, other);
+    Ok((render(root), kept))
 }
 
 fn strip_managed(hooks: &mut Map<String, Value>, which: impl Fn(&str) -> bool) {
@@ -302,7 +415,14 @@ fn strip_managed(hooks: &mut Map<String, Value>, which: impl Fn(&str) -> bool) {
 /// Remove our hook entries (and legacy ones), plus groups and events left
 /// empty by that.
 pub fn remove(text: Option<&str>) -> Result<String, HookError> {
+    remove_with(text, None)
+}
+
+/// [`remove`], putting `restore` (the saved `statusline_command`) back as the
+/// status line.
+pub fn remove_with(text: Option<&str>, restore: Option<&str>) -> Result<String, HookError> {
     let mut root = parse_root(text)?;
+    remove_statusline(&mut root, restore);
     if let Some(Value::Object(hooks)) = root.get_mut("hooks") {
         strip_managed(hooks, |_| true);
         if hooks.is_empty() {
@@ -317,7 +437,7 @@ pub fn remove(text: Option<&str>) -> Result<String, HookError> {
 pub enum HookStatus {
     /// None of our hooks.
     Missing,
-    /// All five, pointing at this binary.
+    /// All five and the status line, pointing at this binary.
     Installed,
     /// Uses the old `attention-hook.sh` script.
     Legacy,
@@ -368,18 +488,26 @@ pub fn status(text: Option<&str>, exe: &Path) -> HookStatus {
     {
         return HookStatus::Stale(other.clone());
     }
-    let complete = HOOKS.iter().all(|spec| {
-        hooks
-            .and_then(|h| h.get(spec.event))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|g| group_matcher(g) == spec.matcher)
-            .filter_map(|g| g.get("hooks").and_then(Value::as_array))
-            .flatten()
-            .filter_map(command_of)
-            .any(|c| matches!(owner(c), Owner::Ours { args, .. } if args == spec.args))
-    });
+    let line = statusline_of(&root);
+    if let StatusLine::Ours(other) = &line {
+        if stale(other) {
+            return HookStatus::Stale(other.clone());
+        }
+    }
+    let line_ok = matches!(line, StatusLine::Ours(_) | StatusLine::Opaque);
+    let complete = line_ok
+        && HOOKS.iter().all(|spec| {
+            hooks
+                .and_then(|h| h.get(spec.event))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|g| group_matcher(g) == spec.matcher)
+                .filter_map(|g| g.get("hooks").and_then(Value::as_array))
+                .flatten()
+                .filter_map(command_of)
+                .any(|c| matches!(owner(c), Owner::Ours { args, .. } if args == spec.args))
+        });
     if complete {
         HookStatus::Installed
     } else {
@@ -391,16 +519,17 @@ pub fn status(text: Option<&str>, exe: &Path) -> HookStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookOp {
     /// Install (or update) the hooks for this executable.
-    Install(PathBuf),
-    /// Remove them.
-    Remove,
+    /// `.1`: the foreign status line command another account already keeps.
+    Install(PathBuf, Option<String>),
+    /// Remove them, restoring this status line command if there is one.
+    Remove(Option<String>),
 }
 
 impl HookOp {
     fn run(&self, text: Option<&str>) -> Result<String, HookError> {
         match self {
-            HookOp::Install(exe) => merge(text, exe),
-            HookOp::Remove => remove(text),
+            HookOp::Install(exe, other) => merge_keeping(text, exe, other.as_deref()).map(|(out, _)| out),
+            HookOp::Remove(restore) => remove_with(text, restore.as_deref()),
         }
     }
 }
@@ -416,6 +545,12 @@ pub struct HookPlan {
     pub after: String,
     /// The change, redone at [`HookPlan::apply`] if the file moved on.
     pub op: HookOp,
+    /// A status line command of the user's that installing replaces: save it
+    /// as `statusline_command` (unless that is already set) before applying.
+    pub kept_statusline: Option<String>,
+    /// A status line command of the user's that was left alone because
+    /// another account's different one is the one kept.
+    pub skipped_statusline: Option<String>,
 }
 
 impl HookPlan {
@@ -473,20 +608,33 @@ fn read_opt(path: &Path) -> Result<Option<String>, HookError> {
 
 /// Plan installing (or updating) the hooks in one config dir.
 pub fn plan_install(config_dir: &Path, exe: &Path) -> Result<HookPlan, HookError> {
-    let path = config_dir.join("settings.json");
-    let before = read_opt(&path)?;
-    let op = HookOp::Install(exe.to_owned());
-    let after = op.run(before.as_deref())?;
-    Ok(HookPlan { path, before, after, op })
+    plan_install_keeping(config_dir, exe, None)
 }
 
-/// Plan removing the hooks from one config dir.
-pub fn plan_uninstall(config_dir: &Path) -> Result<HookPlan, HookError> {
+/// [`plan_install`] when another account's foreign status line command
+/// (`other`) is already kept: a different one here is left untouched and
+/// reported in [`HookPlan::skipped_statusline`].
+pub fn plan_install_keeping(config_dir: &Path, exe: &Path, other: Option<&str>) -> Result<HookPlan, HookError> {
     let path = config_dir.join("settings.json");
     let before = read_opt(&path)?;
-    let op = HookOp::Remove;
+    let op = HookOp::Install(exe.to_owned(), other.map(str::to_owned));
+    let (after, kept) = merge_keeping(before.as_deref(), exe, other)?;
+    let (kept_statusline, skipped_statusline) = match kept {
+        Kept::Nothing => (None, None),
+        Kept::Replaced(c) => (Some(c), None),
+        Kept::Skipped(c) => (None, Some(c)),
+    };
+    Ok(HookPlan { path, before, after, op, kept_statusline, skipped_statusline })
+}
+
+/// Plan removing the hooks from one config dir; `restore` is the saved
+/// `statusline_command`, put back as the status line.
+pub fn plan_uninstall(config_dir: &Path, restore: Option<&str>) -> Result<HookPlan, HookError> {
+    let path = config_dir.join("settings.json");
+    let before = read_opt(&path)?;
+    let op = HookOp::Remove(restore.map(str::to_owned));
     let after = op.run(before.as_deref())?;
-    Ok(HookPlan { path, before, after, op })
+    Ok(HookPlan { path, before, after, op, kept_statusline: None, skipped_statusline: None })
 }
 
 /// Hook status of one config dir.
@@ -588,7 +736,7 @@ mod tests {
         let out = merge(Some(before), exe()).unwrap();
         let j = v(&out);
         let keys: Vec<_> = j.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys, ["model", "hooks"]);
+        assert_eq!(keys, ["model", "hooks", "statusLine"]);
         let post = j["hooks"]["PostToolUse"].as_array().unwrap();
         assert_eq!(post.len(), 2, "migrated in place, no new group");
         assert_eq!(post[0]["hooks"][0]["command"], "prettier --write");
@@ -694,6 +842,96 @@ mod tests {
     }
 
     #[test]
+    fn statusline_fresh_foreign_and_idempotent() {
+        let ours = statusline_command(exe());
+        // Fresh: set, nothing to keep.
+        let (out, kept) = merge_with(None, exe()).unwrap();
+        assert_eq!(kept, None);
+        assert_eq!(v(&out)["statusLine"], json!({"type": "command", "command": ours}));
+        assert_eq!(status(Some(&out), exe()), HookStatus::Installed);
+        // Hooks without a status line (an older install) need an update.
+        let no_line = {
+            let mut j = v(&out);
+            j.as_object_mut().unwrap().remove("statusLine");
+            j.to_string()
+        };
+        assert_eq!(status(Some(&no_line), exe()), HookStatus::Partial);
+        // A foreign one is handed back, replaced, and its other keys stay.
+        let before = r#"{"statusLine": {"type": "command", "command": "~/my-line.sh --fancy", "padding": 2}}"#;
+        let (out, kept) = merge_with(Some(before), exe()).unwrap();
+        assert_eq!(kept.as_deref(), Some("~/my-line.sh --fancy"));
+        assert_eq!(v(&out)["statusLine"]["command"], ours);
+        assert_eq!(v(&out)["statusLine"]["padding"], 2);
+        // Re-installing changes nothing and keeps nothing new to save.
+        let (again, kept) = merge_with(Some(&out), exe()).unwrap();
+        assert_eq!(again, out);
+        assert_eq!(kept, None);
+        // Another copy of ours is repointed, not saved as foreign.
+        let old = merge(None, Path::new("/old/place/clawdmeter")).unwrap();
+        assert!(matches!(status(Some(&old), exe()), HookStatus::Stale(_)));
+        let (fixed, kept) = merge_with(Some(&old), exe()).unwrap();
+        assert_eq!(kept, None);
+        assert_eq!(v(&fixed)["statusLine"]["command"], ours);
+        // A status line we can't carry over is left alone, and isn't a nag.
+        let odd = r#"{"statusLine": {"type": "text"}}"#;
+        let (out, kept) = merge_with(Some(odd), exe()).unwrap();
+        assert_eq!(kept, None);
+        assert_eq!(v(&out)["statusLine"], json!({"type": "text"}));
+        assert_eq!(status(Some(&out), exe()), HookStatus::Installed);
+    }
+
+    #[test]
+    fn statusline_removal_restores_the_saved_command() {
+        let (out, _) = merge_with(Some(r#"{"statusLine": {"type": "command", "command": "mine.sh"}}"#), exe()).unwrap();
+        let restored = remove_with(Some(&out), Some("mine.sh")).unwrap();
+        assert_eq!(v(&restored)["statusLine"]["command"], "mine.sh");
+        assert!(v(&restored).get("hooks").is_none());
+        // Nothing saved: ours just goes.
+        assert!(v(&remove(Some(&out)).unwrap()).get("statusLine").is_none());
+        // Someone else's status line is never touched.
+        let theirs = r#"{"statusLine": {"type": "command", "command": "theirs.sh"}}"#;
+        assert_eq!(v(&remove_with(Some(theirs), Some("mine.sh")).unwrap())["statusLine"]["command"], "theirs.sh");
+        assert_eq!(statusline_owner("/x/clawdmeter statusline"), StatusLine::Ours("/x/clawdmeter".into()));
+        assert!(matches!(statusline_owner("/x/clawdmeter statusline --x"), StatusLine::Foreign(_)));
+    }
+
+    #[test]
+    fn second_different_foreign_statusline_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("cm-hooksl2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let sl = |c: &str| format!(r#"{{"statusLine":{{"type":"command","command":"{c}"}}}}"#);
+        fs::write(dir.join("settings.json"), sl("b.sh")).unwrap();
+        let plan = plan_install_keeping(&dir, exe(), Some("a.sh")).unwrap();
+        assert_eq!((plan.kept_statusline, plan.skipped_statusline.as_deref()), (None, Some("b.sh")));
+        let after: Value = serde_json::from_str(&plan.after).unwrap();
+        assert_eq!(after["statusLine"]["command"], "b.sh");
+        assert!(after["hooks"]["Stop"].is_array(), "hooks still install");
+        // The same command as the kept one is replaced as usual.
+        fs::write(dir.join("settings.json"), sl("a.sh")).unwrap();
+        let plan = plan_install_keeping(&dir, exe(), Some("a.sh")).unwrap();
+        assert_eq!((plan.kept_statusline.as_deref(), plan.skipped_statusline), (Some("a.sh"), None));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_carries_the_foreign_statusline() {
+        let dir = std::env::temp_dir().join(format!("cm-hooksl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("settings.json"), r#"{"statusLine":{"type":"command","command":"mine.sh"}}"#).unwrap();
+        let plan = plan_install(&dir, exe()).unwrap();
+        assert_eq!(plan.kept_statusline.as_deref(), Some("mine.sh"));
+        plan.apply().unwrap();
+        let again = plan_install(&dir, exe()).unwrap();
+        assert!(!again.changes() && again.kept_statusline.is_none());
+        plan_uninstall(&dir, Some("mine.sh")).unwrap().apply().unwrap();
+        let j: Value = serde_json::from_str(&fs::read_to_string(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(j["statusLine"]["command"], "mine.sh");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn apply_keeps_edits_made_after_the_preview() {
         let dir = std::env::temp_dir().join(format!("cm-hookstale-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -708,7 +946,7 @@ mod tests {
         assert_eq!(v["theme"], "dark");
         assert_eq!(dir_status(&dir, exe()), HookStatus::Installed);
         // Broken in the meantime: nothing is written.
-        let plan = plan_uninstall(&dir).unwrap();
+        let plan = plan_uninstall(&dir, None).unwrap();
         fs::write(&path, "{ not json").unwrap();
         assert!(matches!(plan.apply(), Err(HookError::Parse(_))));
         assert_eq!(fs::read_to_string(&path).unwrap(), "{ not json");
@@ -727,7 +965,7 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("settings.json.bak")).unwrap(), "{\"model\":\"opus\"}");
         assert_eq!(dir_status(&dir, exe()), HookStatus::Installed);
         assert!(!plan_install(&dir, exe()).unwrap().changes());
-        plan_uninstall(&dir).unwrap().apply().unwrap();
+        plan_uninstall(&dir, None).unwrap().apply().unwrap();
         assert_eq!(dir_status(&dir, exe()), HookStatus::Missing);
         assert_eq!(
             fs::read_to_string(dir.join("settings.json.bak")).unwrap(),

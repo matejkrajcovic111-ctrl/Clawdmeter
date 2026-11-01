@@ -1,4 +1,5 @@
 #include "performer.h"
+#include "account_tint.h"
 #include "clawd_anim.h"
 #include "clawd_policy.h"
 #include "field.h"
@@ -35,9 +36,17 @@ static const char* const GROUP_NAMES[GROUP_COUNT][GROUP_MAX] = {
     { "laptop", "dancing", "skateboard", "soccer" },          // active
     { "racing car", "cloud", "sailing scene", "jumping happy" }, // heavy burn
 };
+// clawdmeter2: account 2's Clawd puts on his own shows.
+static const char* const GROUP_NAMES_2[GROUP_COUNT][GROUP_MAX] = {
+    { "cloud", "sailing scene", "walking", "magnifier" },      // idle / sleepy: daydreams
+    { "skateboard", "laptop", "basketball", "waving" },        // normal pace
+    { "trumpet", "soccer", "crab walking", "dancing" },        // active
+    { "racing car", "jumping happy", "skateboard", "trumpet" }, // heavy burn
+};
 // The screensaver's calm dips: gentle Idle-group scenes only (lurking is a
 // corner act and pointing is his "noticing" gesture).
 static const char* const CALM_NAMES[] = { "magnifier", "walking" };
+static const char* const CALM_NAMES_2[] = { "cloud", "sailing scene" };
 
 // ─── Performer ───────────────────────────────────────────────────────────────
 enum PerfState { P_OFF, P_STAND, P_WALK, P_SCENE, P_CHOREO };
@@ -114,6 +123,9 @@ static void set_hidden(void* on) {
     else    lv_obj_clear_flag(img, LV_OBJ_FLAG_HIDDEN);
 }
 
+// The account colour changed: repaint every cell at the next frame.
+void performer_retint(void) { drawn_palette = NULL; }
+
 static void render_cells(const uint8_t* cells, const uint16_t* palette) {
     if (!buf || !img) return;
     bool any = false;
@@ -132,7 +144,7 @@ static void render_cells(const uint8_t* cells, const uint16_t* palette) {
             if (gx > gx1) gx1 = gx;
             if (gy < gy0) gy0 = gy;
             if (gy > gy1) gy1 = gy;
-            const uint16_t c = (code && palette && code < CLAWD_PALETTE_SIZE) ? palette[code] : 0;
+            const uint16_t c = (code && palette && code < CLAWD_PALETTE_SIZE) ? account_tint(palette[code]) : 0;
             const uint8_t  a = code ? 255 : 0;
             for (int d = 0; d < cell; d++) {
                 const size_t row = (size_t)(gy * cell + d) * dim + gx * cell;
@@ -358,8 +370,9 @@ void performer_perform_group(int group, uint32_t loop_ms, bool calm) {
     if (!img) return;
     if (!rng_seeded) { clawd_rng_seed(&rng, millis() ^ 0x57A6E); rng_seeded = true; }
     if (group < 0 || group >= GROUP_COUNT) group = 0;
-    const char* const* names = calm ? CALM_NAMES : GROUP_NAMES[group];
-    const int n = calm ? (int)(sizeof(CALM_NAMES) / sizeof(CALM_NAMES[0])) : GROUP_MAX;
+    const bool two = g_account_tint;
+    const char* const* names = calm ? (two ? CALM_NAMES_2 : CALM_NAMES) : (two ? GROUP_NAMES_2[group] : GROUP_NAMES[group]);
+    const int n = calm ? 2 : GROUP_MAX;
     const char*& last = calm ? last_calm : last_show;
     const int pick = clawd_pick_no_repeat(names, n, last, &rng);
     const ClawdAnim* a = pick >= 0 ? clawd_anim(names[pick]) : NULL;

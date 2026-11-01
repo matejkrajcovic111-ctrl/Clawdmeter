@@ -200,9 +200,9 @@ static void test_large_480x480(void) {
     TEST_ASSERT_EQUAL_INT16(94, L.reset_y);
     TEST_ASSERT_EQUAL_PTR(&font_styrene_48, L.pct_font);
     TEST_ASSERT_EQUAL_PTR(&font_styrene_28, L.period_font);
-    TEST_ASSERT_EQUAL_PTR(&font_tiempos_56, L.title_font[0]);
-    TEST_ASSERT_EQUAL_PTR(&font_tiempos_56, L.title_font[1]);
-    TEST_ASSERT_EQUAL_INT16(30, L.title_y[0]);  TEST_ASSERT_EQUAL_INT16(256, L.title_cx);
+    TEST_ASSERT_EQUAL_PTR(&font_styrene_48, L.title_font[0]);
+    TEST_ASSERT_EQUAL_PTR(&font_styrene_48, L.title_font[1]);
+    TEST_ASSERT_EQUAL_INT16(30, L.title_y[0]);  TEST_ASSERT_EQUAL_INT16(240, L.title_cx);
     TEST_ASSERT_EQUAL_INT16(20, L.logo_x);      TEST_ASSERT_EQUAL_INT16(20, L.logo_y);
     TEST_ASSERT_EQUAL_INT16(412, L.batt_x);     TEST_ASSERT_EQUAL_INT16(30, L.batt_y);
     TEST_ASSERT_EQUAL_PTR(&font_mono_32, L.status_font);
@@ -219,8 +219,8 @@ static void test_compact_368x448(void) {
     TEST_ASSERT_EQUAL_INT16(238, L.card[1].y);  TEST_ASSERT_EQUAL_INT16(328, L.card[0].w);
     TEST_ASSERT_EQUAL_INT16(48, L.bar_y);       TEST_ASSERT_EQUAL_INT16(78, L.reset_y);
     TEST_ASSERT_EQUAL_PTR(&font_styrene_48, L.pct_font);
-    TEST_ASSERT_EQUAL_PTR(&font_tiempos_56, L.title_font[0]);
-    TEST_ASSERT_EQUAL_PTR(&font_tiempos_34, L.title_font[1]);   // 12-hour clock: one size down
+    TEST_ASSERT_EQUAL_PTR(&font_styrene_48, L.title_font[0]);
+    TEST_ASSERT_EQUAL_PTR(&font_styrene_28, L.title_font[1]);   // 12-hour clock: one size down
     TEST_ASSERT_EQUAL_PTR(&font_styrene_20, L.period_font);     // period line: one size down
     TEST_ASSERT_EQUAL_PTR(&font_styrene_28, L.pair_font[0]);
     TEST_ASSERT_EQUAL_INT16(-15, L.status_y);
@@ -231,7 +231,7 @@ static void test_large_410x502(void) {
     TEST_ASSERT_EQUAL_INT16(100, L.card[0].y);  TEST_ASSERT_EQUAL_INT16(150, L.card[0].h);
     TEST_ASSERT_EQUAL_INT16(370, L.card[0].w);
     TEST_ASSERT_EQUAL_PTR(&font_styrene_48, L.pair_font[0]);
-    TEST_ASSERT_EQUAL_PTR(&font_tiempos_34, L.title_font[1]);
+    TEST_ASSERT_EQUAL_PTR(&font_styrene_28, L.title_font[1]);
     TEST_ASSERT_EQUAL_INT16(-15, L.status_y);
 }
 
@@ -243,9 +243,9 @@ static void test_small_240x240(void) {
     TEST_ASSERT_EQUAL_INT16(30, L.bar_y);       TEST_ASSERT_EQUAL_INT16(12, L.bar_h);
     TEST_ASSERT_EQUAL_INT16(46, L.reset_y);
     TEST_ASSERT_TRUE(L.small_icons);
-    TEST_ASSERT_EQUAL_PTR(&font_tiempos_34, L.title_font[0]);
+    TEST_ASSERT_EQUAL_PTR(&font_styrene_28, L.title_font[0]);
     TEST_ASSERT_EQUAL_PTR(&font_styrene_24, L.title_font[1]);
-    TEST_ASSERT_EQUAL_INT16(4, L.title_y[0]);   TEST_ASSERT_EQUAL_INT16(128, L.title_cx);
+    TEST_ASSERT_EQUAL_INT16(4, L.title_y[0]);   TEST_ASSERT_EQUAL_INT16(120, L.title_cx);
     TEST_ASSERT_EQUAL_INT16(208, L.batt_x);     TEST_ASSERT_EQUAL_INT16(10, L.batt_y);
     TEST_ASSERT_EQUAL_PTR(&font_mono_18, L.status_font);
     TEST_ASSERT_EQUAL_INT16(-10, L.status_y);
